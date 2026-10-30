@@ -12,6 +12,8 @@ pub struct Status<'a> {
     pub mode: &'a str,
     pub pending: &'a str,
     /// Search position `(i, n)`, 1-based.
+    /// Background job text, e.g. `analysing 120/552`.
+    pub job: Option<&'a str>,
     pub search: Option<(usize, usize, bool)>,
 }
 
@@ -31,6 +33,9 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, s: &Status) {
     }
     if let Some((i, n, done)) = s.search {
         right.push_str(&format!("[{i}/{n}{}]  ", if done { "" } else { "+" }));
+    }
+    if let Some(j) = s.job {
+        right.push_str(&format!("{j}  "));
     }
     right.push_str(&format!("[{}/{}]  {}%  {}", s.page, s.total, s.zoom_pct, s.mode));
     let rw = t.width(&right);

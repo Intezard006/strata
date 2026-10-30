@@ -16,6 +16,11 @@ set font                 "monospace"
 set font-size            13
 set incremental-search   true
 
+# Background analysis (runs in a separate niced process, results cached in ~/.cache/strata)
+set auto-analyze         true
+set auto-ocr             true     # OCR scanned documents with ocrmypdf
+set auto-index           auto     # auto: only when the file has no outline | always | off
+
 # map [mode] KEYS COMMAND     (modes: normal, index)
 map <C-x> goto 1
 # unmap <Space>

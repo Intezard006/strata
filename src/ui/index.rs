@@ -10,6 +10,7 @@ pub struct Item {
     pub title: String,
     pub depth: u32,
     pub page: Option<u32>,
+    pub y: Option<f32>,
     pub uri: Option<String>,
     pub has_children: bool,
 }
@@ -106,11 +107,12 @@ impl Index {
     }
 }
 
-pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, bottom_reserved: i32) -> usize {
+pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, auto: bool, bottom_reserved: i32) -> usize {
     cv.fill_rect(0, 0, cv.w, cv.h - bottom_reserved, panel_bg());
     let (lh, cw) = (t.line_h, t.width("M").max(1));
     let pad = cw * 2;
-    t.draw(cv, pad, 6, "Index  (j/k move, l/h expand/collapse, Enter jump, Tab close)", ACCENT, cv.w - 2 * pad);
+    let title = format!("Index{}  (j/k move, l/h expand/collapse, Enter jump, Tab close)", if auto { " (auto)" } else { "" });
+    t.draw(cv, pad, 6, &title, ACCENT, cv.w - 2 * pad);
     let top = lh + 14;
     let rows = ((cv.h - bottom_reserved - top - 6) / lh).max(1) as usize;
     if ix.items.is_empty() {
@@ -141,7 +143,7 @@ mod tests {
     use super::*;
 
     fn it(t: &str, depth: u32, kids: bool) -> Item {
-        Item { title: t.into(), depth, page: Some(0), uri: None, has_children: kids }
+        Item { title: t.into(), depth, page: Some(0), y: None, uri: None, has_children: kids }
     }
 
     #[test]

@@ -4,18 +4,20 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Window, WindowId};
 
-use crate::config::{self, premultiply, Config};
+use crate::cache::{self, Analysis, OcrState};
+use crate::config::{self, premultiply, AutoIndex, Config};
 use crate::keys::{self, Command, KeyState, Keymap, Mode};
 use crate::layout::{page_px, tile_grid, Layout};
 use crate::links::{hint_labels, open_external, Jumplist, LinkInfo, Target, HINT_ALPHABET};
@@ -24,7 +26,8 @@ use crate::render::{Cmd, RenderHandle, Request, Response, SearchReq, Tile, TileC
 use crate::search::{case_sensitive, Hit, Search};
 use crate::text::TextRenderer;
 use crate::ui::help::Help;
-use crate::ui::index::{self, Index};
+use crate::ui::index::{self, Index, Item};
+use crate::worker::{Job, Msg};
 use crate::ui::input::{History, InputBar};
 use crate::ui::statusbar::{self, Status};
 use crate::ui::{over, pm, Canvas, FG};
@@ -65,6 +68,7 @@ struct Applied {
     recolor: Recolor,
     gap: f32,
     font: (String, f32),
+    auto_index: AutoIndex,
 }
 
 pub struct App {
@@ -107,18 +111,35 @@ pub struct App {
     jumps: Jumplist,
     /// Set while an `open` is in flight: the new path, and the scroll to keep on reload.
     opening: Option<(PathBuf, Option<f32>)>,
+    proxy: EventLoopProxy<()>,
+    worker_tx: Sender<(u64, Msg)>,
+    worker_rx: Receiver<(u64, Msg)>,
+    job: Option<(Job, JobKind)>,
+    job_seq: u64,
+    job_status: Option<String>,
+    outline_items: Vec<Item>,
+    auto_items: Vec<Item>,
+    index_auto: bool,
+    analysis: Option<Analysis>,
+}
+
+#[derive(Clone, Debug)]
+enum JobKind {
+    Analyze,
+    WriteIndex(PathBuf),
 }
 
 impl App {
-    pub fn new(render: RenderHandle, sizes: Vec<(f32, f32)>, path: PathBuf) -> Self {
+    pub fn new(render: RenderHandle, sizes: Vec<(f32, f32)>, path: PathBuf, proxy: EventLoopProxy<()>) -> Self {
         let cfg = Config::default();
+        let (worker_tx, worker_rx) = channel();
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut app = App {
             render,
             layout: Layout::new(sizes, cfg.page_gap),
             path,
             name,
-            applied: Applied { recolor: cfg.effective_recolor(), gap: cfg.page_gap, font: (String::new(), 0.0) },
+            applied: Applied { recolor: cfg.effective_recolor(), gap: cfg.page_gap, font: (String::new(), 0.0), auto_index: cfg.auto_index },
             bg: premultiply(cfg.default_bg),
             cache: TileCache::new(cfg.cache_mb << 20),
             cfg,
@@ -151,6 +172,16 @@ impl App {
             pre_search_sy: 0.0,
             jumps: Jumplist::default(),
             opening: None,
+            proxy,
+            worker_tx,
+            worker_rx,
+            job: None,
+            job_seq: 0,
+            job_status: None,
+            outline_items: Vec::new(),
+            auto_items: Vec::new(),
+            index_auto: false,
+            analysis: None,
         };
         app.load_config();
         app
@@ -229,8 +260,128 @@ impl App {
             }
             self.applied.font = font;
         }
+        if self.cfg.auto_index != self.applied.auto_index {
+            self.applied.auto_index = self.cfg.auto_index;
+            self.refresh_index();
+        }
         self.clamp_scroll();
         self.redraw();
+    }
+
+    // ---- analysis -----------------------------------------------------------------------
+
+    /// Pick the real outline or the generated one according to `auto-index`.
+    fn refresh_index(&mut self) {
+        let auto = !self.auto_items.is_empty()
+            && match self.cfg.auto_index {
+                AutoIndex::Off => false,
+                AutoIndex::Always => true,
+                AutoIndex::Auto => self.outline_items.is_empty(),
+            };
+        self.index_auto = auto;
+        self.index = Index::new(if auto { self.auto_items.clone() } else { self.outline_items.clone() });
+    }
+
+    fn cancel_job(&mut self) {
+        self.job = None; // Drop kills the process group
+        self.job_status = None;
+    }
+
+    /// Use the cached analysis if valid, otherwise run the niced child. `force_ocr` / `recompute` skip the cache.
+    fn start_analysis(&mut self, force_ocr: bool, recompute: bool) {
+        self.cancel_job();
+        let Ok(dir) = cache::dir_for(&self.path) else { return };
+        if !force_ocr && !recompute {
+            if let Some(a) = cache::load(&dir) {
+                self.apply_analysis(a, &dir);
+                return;
+            }
+        }
+        if !self.cfg.auto_analyze && !force_ocr && !recompute {
+            return;
+        }
+        let file = self.path.display().to_string();
+        let mut args = vec!["--analyze", file.as_str()];
+        if force_ocr {
+            args.push("--ocr");
+        } else if !self.cfg.auto_ocr {
+            args.push("--no-ocr");
+        }
+        self.spawn_job(&args, JobKind::Analyze);
+    }
+
+    fn spawn_job(&mut self, args: &[&str], kind: JobKind) {
+        self.job_seq += 1;
+        match Job::spawn(self.job_seq, args, self.worker_tx.clone(), self.proxy.clone()) {
+            Ok(j) => {
+                self.job = Some((j, kind));
+                self.job_status = Some("starting analysis...".into());
+            }
+            Err(e) => self.err(format!("cannot start analysis: {e}")),
+        }
+    }
+
+    fn apply_analysis(&mut self, a: Analysis, dir: &std::path::Path) {
+        self.auto_items = a
+            .index
+            .iter()
+            .map(|e| Item {
+                title: e.title.clone(),
+                depth: e.level as u32 - 1,
+                page: Some(e.page),
+                y: Some(e.y),
+                uri: None,
+                has_children: false,
+            })
+            .collect();
+        // children flags from depth ordering
+        for i in 0..self.auto_items.len().saturating_sub(1) {
+            self.auto_items[i].has_children = self.auto_items[i + 1].depth > self.auto_items[i].depth;
+        }
+        let ocr = cache::ocr_path(dir);
+        let src = (a.ocr == OcrState::Done && ocr.exists()).then_some(ocr);
+        let _ = self.render.req_tx.send(Cmd::TextSource(src));
+        if let OcrState::Failed(e) = &a.ocr {
+            self.err(format!("OCR: {e}"));
+        }
+        self.analysis = Some(a);
+        self.refresh_index();
+    }
+
+    fn on_worker(&mut self, id: u64, m: Msg) {
+        if self.job.as_ref().map(|j| j.0.id) != Some(id) {
+            return; // from a cancelled job
+        }
+        match m {
+            Msg::Progress(d, t) => self.job_status = Some(format!("analysing {d}/{t}")),
+            Msg::Status(s) => self.job_status = Some(s),
+            Msg::Error(e) => self.err(e),
+            Msg::Done => {
+                let kind = self.job.as_ref().map(|j| j.1.clone());
+                self.job_status = None;
+                match kind {
+                    Some(JobKind::WriteIndex(dst)) => self.msg(format!("Wrote {}", dst.display())),
+                    _ => {
+                        if let Ok(dir) = cache::dir_for(&self.path) {
+                            if let Some(a) = cache::load(&dir) {
+                                let ocr_done = a.ocr == OcrState::Done;
+                                self.apply_analysis(a, &dir);
+                                if ocr_done && self.message.is_none() {
+                                    self.msg("OCR complete; search uses the OCR text".into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Msg::Exited => {
+                if let Some(j) = self.job.as_mut() {
+                    j.0.mark_exited();
+                }
+                self.job = None;
+                self.job_status = None;
+            }
+        }
     }
 
     fn msg(&mut self, s: String) {
@@ -314,6 +465,16 @@ impl App {
 
     fn goto_page(&mut self, p: usize) {
         self.sy = self.layout.top(p.min(self.layout.len() - 1));
+        self.clamp_scroll();
+    }
+
+    /// Jump to `y` points below the page top (a little context is kept above).
+    fn goto_page_y(&mut self, p: usize, y: Option<f32>) {
+        let p = p.min(self.layout.len() - 1);
+        self.sy = match y {
+            Some(y) => (self.layout.top(p) + y - 24.0).max(self.layout.top(p)),
+            None => self.layout.top(p),
+        };
         self.clamp_scroll();
     }
 
@@ -421,7 +582,7 @@ impl App {
                     match (it.page, it.uri) {
                         (Some(p), _) => {
                             self.jumps.push(self.sy);
-                            self.goto_page(p as usize);
+                            self.goto_page_y(p as usize, it.y);
                             self.mode = Mode::Normal;
                         }
                         (None, Some(u)) => {
@@ -452,6 +613,22 @@ impl App {
                 self.opening = Some((self.path.clone(), Some(self.sy)));
                 let _ = self.render.req_tx.send(Cmd::Open(self.path.clone()));
             }
+            Command::Ocr => {
+                self.start_analysis(true, false);
+                if self.job.is_some() {
+                    self.msg("OCR started (see statusbar)".into());
+                }
+            }
+            Command::OcrCancel => {
+                if self.job.is_some() {
+                    self.cancel_job();
+                    self.msg("Analysis cancelled".into());
+                } else {
+                    self.err("No job running".into());
+                }
+            }
+            Command::Reindex => self.start_analysis(false, true),
+            Command::WriteIndex(path, force) => self.write_index(path, force),
             Command::ReloadConfig => {
                 self.load_config();
                 if self.message.is_none() {
@@ -466,6 +643,31 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    fn write_index(&mut self, path: Option<String>, force: bool) {
+        if self.auto_items.is_empty() {
+            return self.err("No generated index (wait for analysis or :reindex)".into());
+        }
+        if self.job.is_some() {
+            return self.err("A background job is running; try again when it finishes".into());
+        }
+        let dst = match path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let stem = self.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                self.path.with_file_name(format!("{stem}.indexed.pdf"))
+            }
+        };
+        if dst == self.path {
+            return self.err("Refusing to overwrite the original".into());
+        }
+        if dst.exists() && !force {
+            return self.err(format!("{} exists; use :writeindex! to overwrite", dst.display()));
+        }
+        let (src, d) = (self.path.display().to_string(), dst.display().to_string());
+        self.spawn_job(&["--write-index", &src, &d], JobKind::WriteIndex(dst));
+        self.job_status = Some("writing index...".into());
     }
 
     // ---- search -------------------------------------------------------------------------
@@ -498,9 +700,9 @@ impl App {
 
     fn follow(&mut self, t: &Target) {
         match t {
-            Target::Page(p) => {
+            Target::Page(p, y) => {
                 self.jumps.push(self.sy);
-                self.goto_page(*p as usize);
+                self.goto_page_y(*p as usize, *y);
             }
             Target::Uri(u) => match open_external(u) {
                 Ok(()) => self.msg(format!("Opened {u}")),
@@ -716,12 +918,17 @@ impl App {
                 self.search = None;
                 self.highlight = false;
                 self.mode = Mode::Normal;
+                self.cancel_job();
+                self.analysis = None;
+                self.auto_items.clear();
+                self.outline_items.clear();
                 self.index = Index::default();
                 self.invalidate(true);
                 self.sx = 0.0;
                 self.sy = keep.unwrap_or(0.0);
                 self.title_page = usize::MAX;
                 self.clamp_scroll();
+                self.start_analysis(false, false);
                 if keep.is_none() {
                     self.msg(format!("Opened {}", self.name));
                 } else {
@@ -843,6 +1050,8 @@ impl App {
             (_, Mode::Index) => "INDEX",
             _ => "NORMAL",
         };
+        let job_text = self.job_status.clone();
+        let index_auto = self.index_auto;
         let search_pos = self.search.as_ref().map(|s| (s.index().map_or(0, |i| i + 1), s.hits.len(), s.done));
         let bar_visible = self.cfg.statusbar;
         let under = !self.cfg.recolor.enabled;
@@ -879,7 +1088,7 @@ impl App {
             if let Overlay::Help(hp) = &self.overlay {
                 help_rows = Some(crate::ui::help::draw(&mut cv, t, hp, bar));
             } else if self.mode == Mode::Index {
-                index_rows = Some(index::draw(&mut cv, t, &mut self.index, bar));
+                index_rows = Some(index::draw(&mut cv, t, &mut self.index, index_auto, bar));
             }
             if bar_visible {
                 let st = Status {
@@ -890,6 +1099,7 @@ impl App {
                     zoom_pct,
                     mode: mode_name,
                     pending: &pending_keys,
+                    job: job_text.as_deref(),
                     search: search_pos,
                 };
                 statusbar::draw(&mut cv, t, &st);
@@ -1026,6 +1236,7 @@ impl ApplicationHandler<()> for App {
         self.applied.font.1 = 0.0; // re-apply font size at the real dpi
         self.apply_config();
         self.exec(Command::FitWidth, None, el);
+        self.start_analysis(false, false);
     }
 
     fn user_event(&mut self, _el: &ActiveEventLoop, _: ()) {
@@ -1074,9 +1285,16 @@ impl ApplicationHandler<()> for App {
                     self.links_pending.remove(&page);
                     self.links.insert(page, links);
                 }
-                Response::Outline(items) => self.index = Index::new(items),
+                Response::Outline(items) => {
+                    self.outline_items = items;
+                    self.refresh_index();
+                }
                 Response::Opened(r) => self.on_opened(r),
             }
+        }
+        while let Ok((id, m)) = self.worker_rx.try_recv() {
+            changed = true;
+            self.on_worker(id, m);
         }
         if tiles {
             let vis = self.visible_tiles();

@@ -73,6 +73,10 @@ pub enum Command {
     Open(String),
     Reload,
     ReloadConfig,
+    Ocr,
+    OcrCancel,
+    Reindex,
+    WriteIndex(Option<String>, bool),
 }
 
 /// `:` command registry: (name, argument synopsis, description).
@@ -125,6 +129,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("reload", "", "Reload the current file"),
     ("reload-config", "", "Re-read the config file"),
     ("source", "", "Re-read the config file"),
+    ("ocr", "", "Run OCR on this document (text layer for search and index)"),
+    ("ocr-cancel", "", "Cancel a running OCR / analysis job"),
+    ("reindex", "", "Recompute the generated index"),
+    ("writeindex", "[PATH]", "Write a copy of the PDF with the generated index as outline"),
+    ("writeindex!", "[PATH]", "Like writeindex, overwriting an existing file"),
 ];
 
 pub fn describe(name: &str) -> &'static str {
@@ -203,6 +212,11 @@ pub fn parse_words(name: &str, args: &[String]) -> Result<Command, String> {
                 Map(mode, keys, cmd)
             }
         }
+        "ocr" => Ocr,
+        "ocr-cancel" => OcrCancel,
+        "reindex" => Reindex,
+        "writeindex" => WriteIndex(args.first().cloned(), false),
+        "writeindex!" => WriteIndex(args.first().cloned(), true),
         "open" => Open(rest()?),
         "reload" => Reload,
         "reload-config" | "source" => ReloadConfig,

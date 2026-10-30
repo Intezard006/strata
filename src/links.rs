@@ -6,7 +6,8 @@ use crate::search::Rect4;
 
 #[derive(Clone, Debug)]
 pub enum Target {
-    Page(u32),
+    /// Page and optional y (points from the page origin).
+    Page(u32, Option<f32>),
     Uri(String),
 }
 

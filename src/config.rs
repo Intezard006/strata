@@ -16,6 +16,16 @@ pub struct Config {
     pub font: String,
     pub font_size: f32,
     pub incremental_search: bool,
+    pub auto_ocr: bool,
+    pub auto_index: AutoIndex,
+    pub auto_analyze: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoIndex {
+    Auto,
+    Always,
+    Off,
 }
 
 /// (name, description) for `:set` completion and the help overlay.
@@ -33,6 +43,9 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("font", "UI font family (resolved with fc-match)"),
     ("font-size", "UI font size in logical pixels"),
     ("incremental-search", "Search while typing (true/false)"),
+    ("auto-ocr", "OCR scanned documents in the background (true/false)"),
+    ("auto-index", "Generated index: auto (only without outline), always, off"),
+    ("auto-analyze", "Analyse documents in a background process (true/false)"),
 ];
 
 impl Default for Config {
@@ -48,6 +61,9 @@ impl Default for Config {
             font: "monospace".into(),
             font_size: 13.0,
             incremental_search: true,
+            auto_ocr: true,
+            auto_index: AutoIndex::Auto,
+            auto_analyze: true,
         }
     }
 }
@@ -125,6 +141,16 @@ impl Config {
             "font" => self.font = v.to_string(),
             "font-size" => self.font_size = parse_num(v, 6.0, 72.0)?,
             "incremental-search" => self.incremental_search = parse_bool(v)?,
+            "auto-ocr" => self.auto_ocr = parse_bool(v)?,
+            "auto-analyze" => self.auto_analyze = parse_bool(v)?,
+            "auto-index" => {
+                self.auto_index = match v {
+                    "auto" => AutoIndex::Auto,
+                    "always" => AutoIndex::Always,
+                    "off" => AutoIndex::Off,
+                    _ => return Err(format!("auto-index: expected auto|always|off, got {v}")),
+                }
+            }
             _ => return Err(format!("unknown option: {name}")),
         }
         Ok(())
@@ -145,6 +171,9 @@ impl Config {
             "font" => self.font.clone(),
             "font-size" => self.font_size.to_string(),
             "incremental-search" => self.incremental_search.to_string(),
+            "auto-ocr" => self.auto_ocr.to_string(),
+            "auto-analyze" => self.auto_analyze.to_string(),
+            "auto-index" => format!("{:?}", self.auto_index).to_lowercase(),
             _ => return None,
         })
     }

@@ -149,6 +149,8 @@ pub enum Cmd {
     CancelSearch,
     Links(u32),
     Open(PathBuf),
+    /// Document to use for text search (the OCR copy), or `None` for the original.
+    TextSource(Option<PathBuf>),
 }
 
 pub enum Response {
@@ -193,6 +195,7 @@ pub fn spawn(path: PathBuf, proxy: EventLoopProxy<()>) -> Result<(RenderHandle, 
                 cs: Colorspace::device_rgb(),
                 doc,
                 path: path.clone(),
+                text_path: path.clone(),
                 loads: 0,
                 sizes: sizes.clone(),
                 queue: Vec::new(),
@@ -215,7 +218,7 @@ pub fn spawn(path: PathBuf, proxy: EventLoopProxy<()>) -> Result<(RenderHandle, 
     }
 }
 
-fn open_doc(path: &PathBuf) -> Result<Document, String> {
+pub fn open_doc(path: &PathBuf) -> Result<Document, String> {
     let mut doc = Document::open(path.as_path()).map_err(|e| e.to_string())?;
     if doc.needs_password().map_err(|e| e.to_string())? {
         return Err("document is password protected".into());
@@ -248,6 +251,16 @@ fn context_ptr() -> Option<*mut mupdf_sys::fz_context> {
     usize::from_str_radix(hex, 16).ok().map(|p| p as *mut _)
 }
 
+/// Vertical target of a destination, in page space.
+fn dest_top(k: &mupdf::DestinationKind) -> Option<f32> {
+    use mupdf::DestinationKind::*;
+    match *k {
+        XYZ { top, .. } | FitH { top } | FitBH { top } => top,
+        FitR { top, .. } => Some(top),
+        _ => None,
+    }
+}
+
 struct SearchState {
     req: SearchReq,
     /// Private document handle: MuPDF keeps every touched page's objects alive, so scanning the
@@ -272,6 +285,7 @@ struct Renderer {
     cs: Colorspace,
     doc: Document,
     path: PathBuf,
+    text_path: PathBuf,
     loads: usize,
     sizes: Vec<(f32, f32)>,
     queue: Vec<Request>,
@@ -323,6 +337,11 @@ impl Renderer {
                 self.search = Some(SearchState { next: start, remaining: n, hits: 0, req, doc: None, since_open: 0 });
             }
             Cmd::CancelSearch => self.search = None,
+            Cmd::TextSource(p) => {
+                let usable = p
+                    .and_then(|p| open_doc(&p).ok().filter(|d| d.page_count().map(|c| c as usize == self.sizes.len()).unwrap_or(false)).map(|_| p));
+                self.text_path = usable.unwrap_or_else(|| self.path.clone());
+            }
             Cmd::Links(p) => {
                 let links = self.load_links(p);
                 self.send(Response::Links { page: p, links });
@@ -334,6 +353,7 @@ impl Renderer {
                 match open(&path) {
                     Ok((doc, sizes)) => {
                         self.doc = doc;
+                        self.text_path = path.clone();
                         self.path = path;
                         self.loads = 0;
                         self.sizes = sizes.clone();
@@ -352,7 +372,7 @@ impl Renderer {
         let Ok(iter) = page.links() else { return vec![] };
         iter.filter_map(|l| {
             let target = match l.dest {
-                Some(d) => Target::Page(d.loc.page_number),
+                Some(d) => Target::Page(d.loc.page_number, dest_top(&d.kind)),
                 None if !l.uri.is_empty() => Target::Uri(l.uri),
                 None => return None,
             };
@@ -368,6 +388,7 @@ impl Renderer {
                     title: o.title.clone(),
                     depth,
                     page: o.dest.map(|d| d.loc.page_number),
+                    y: o.dest.and_then(|d| dest_top(&d.kind)),
                     uri: o.uri.clone(),
                     has_children: !o.down.is_empty(),
                 });
@@ -430,7 +451,7 @@ impl Renderer {
         if st.doc.is_none() || st.since_open >= 64 {
             st.doc = None; // free the old handle before opening the next
             unsafe { malloc_trim(0) };
-            st.doc = open_doc(&self.path).ok();
+            st.doc = open_doc(&self.text_path).ok();
             st.since_open = 0;
         }
         st.since_open += 1;
