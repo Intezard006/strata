@@ -1,0 +1,22 @@
+# strata config: copy to ~/.config/strata/stratarc (or $XDG_CONFIG_HOME/strata/stratarc)
+# Mirrors the zathura look: translucent catppuccin background, white ink, transparent paper.
+
+set default-bg           "#1e1e2e99"
+set recolor              true
+set recolor-lightcolor   "#1e1e2e"
+set recolor-darkcolor    "#ffffff"
+set recolor-keephue      false
+
+set cache-mb             64
+set scroll-step          40
+set zoom-step            10
+set page-gap             8
+set statusbar            true
+set font                 "monospace"
+set font-size            13
+set incremental-search   true
+
+# map [mode] KEYS COMMAND     (modes: normal, index)
+map <C-x> goto 1
+# unmap <Space>
+# include ~/.config/strata/extra.rc

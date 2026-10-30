@@ -1,12 +1,27 @@
-//! Keybinding table and sequence matching. Phase 2 derives the help overlay and
-//! config `map` handling from `BINDINGS`.
+//! Commands, the command registry (names/descriptions for `:` and help) and the keymap.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
     Normal,
+    Index,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl Mode {
+    pub const ALL: [Mode; 2] = [Mode::Normal, Mode::Index];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Normal => "normal",
+            Mode::Index => "index",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Mode> {
+        Mode::ALL.into_iter().find(|m| m.name() == s)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     ScrollDown,
     ScrollUp,
@@ -16,55 +31,253 @@ pub enum Command {
     HalfPageUp,
     NextPage,
     PrevPage,
-    /// `gg`: first page, or page N with a count.
-    GotoFirst,
-    /// `G`: last page, or page N with a count.
-    GotoLast,
+    /// First page, or page N with a count.
+    FirstPage,
+    /// Last page, or page N with a count.
+    LastPage,
+    Goto(u32),
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    /// Zoom to a percentage.
+    Zoom(f32),
     FitWidth,
     FitPage,
     ToggleRecolor,
+    ToggleStatusbar,
     Quit,
+    CommandMode,
+    SearchForward,
+    SearchBackward,
+    Search(String),
+    BSearch(String),
+    SearchNext,
+    SearchPrev,
+    ClearHighlight,
+    Follow,
+    JumpBack,
+    JumpForward,
+    Help,
+    Index,
+    IndexDown,
+    IndexUp,
+    IndexExpand,
+    IndexCollapse,
+    IndexSelect,
+    IndexClose,
+    IndexFirst,
+    IndexLast,
+    Set(String, Option<String>),
+    Map(Mode, String, String),
+    Unmap(Mode, String),
+    Open(String),
+    Reload,
+    ReloadConfig,
 }
 
-#[allow(dead_code)] // `description` is consumed by the phase 2 help overlay
-pub struct Binding {
-    pub keys: &'static str,
-    pub mode: Mode,
-    pub command: Command,
-    pub description: &'static str,
-}
-
-const fn b(keys: &'static str, command: Command, description: &'static str) -> Binding {
-    Binding { keys, mode: Mode::Normal, command, description }
-}
-
-/// Key tokens: plain characters ("j", "G", "+"), "<C-x>" for Ctrl, "<Space>", "<S-Space>".
-pub const BINDINGS: &[Binding] = &[
-    b("j", Command::ScrollDown, "Scroll down"),
-    b("k", Command::ScrollUp, "Scroll up"),
-    b("h", Command::ScrollLeft, "Scroll left"),
-    b("l", Command::ScrollRight, "Scroll right"),
-    b("<C-d>", Command::HalfPageDown, "Scroll half a page down"),
-    b("<C-u>", Command::HalfPageUp, "Scroll half a page up"),
-    b("J", Command::NextPage, "Next page"),
-    b("K", Command::PrevPage, "Previous page"),
-    b("<Space>", Command::NextPage, "Next page"),
-    b("<S-Space>", Command::PrevPage, "Previous page"),
-    b("gg", Command::GotoFirst, "First page (or page N with a count)"),
-    b("G", Command::GotoLast, "Last page (or page N with a count)"),
-    b("+", Command::ZoomIn, "Zoom in"),
-    b("-", Command::ZoomOut, "Zoom out"),
-    b("=", Command::ZoomReset, "Reset zoom"),
-    b("s", Command::FitWidth, "Fit width"),
-    b("a", Command::FitPage, "Fit page"),
-    b("<C-r>", Command::ToggleRecolor, "Toggle recolor"),
-    b("q", Command::Quit, "Quit"),
+/// `:` command registry: (name, argument synopsis, description).
+pub const COMMANDS: &[(&str, &str, &str)] = &[
+    ("scroll-down", "", "Scroll down"),
+    ("scroll-up", "", "Scroll up"),
+    ("scroll-left", "", "Scroll left"),
+    ("scroll-right", "", "Scroll right"),
+    ("half-page-down", "", "Scroll half a page down"),
+    ("half-page-up", "", "Scroll half a page up"),
+    ("next-page", "", "Next page"),
+    ("prev-page", "", "Previous page"),
+    ("first-page", "", "First page (or page N with a count)"),
+    ("last-page", "", "Last page (or page N with a count)"),
+    ("goto", "N", "Go to page N"),
+    ("zoom-in", "", "Zoom in"),
+    ("zoom-out", "", "Zoom out"),
+    ("zoom-reset", "", "Reset zoom to 100%"),
+    ("zoom", "PERCENT", "Set zoom to PERCENT"),
+    ("fit-width", "", "Fit page width"),
+    ("fit-page", "", "Fit whole page"),
+    ("toggle-recolor", "", "Toggle recolor"),
+    ("toggle-statusbar", "", "Show or hide the statusbar"),
+    ("quit", "", "Quit"),
+    ("command-mode", "", "Open the command line"),
+    ("search-forward", "", "Start a forward search"),
+    ("search-backward", "", "Start a backward search"),
+    ("search", "TEXT", "Search forward for TEXT"),
+    ("bsearch", "TEXT", "Search backward for TEXT"),
+    ("search-next", "", "Next search hit"),
+    ("search-prev", "", "Previous search hit"),
+    ("nohl", "", "Clear search highlights"),
+    ("follow", "", "Show link hints and follow a link"),
+    ("jump-back", "", "Jump back in the jumplist"),
+    ("jump-forward", "", "Jump forward in the jumplist"),
+    ("help", "", "Show the help overlay"),
+    ("index", "", "Toggle the index (outline) panel"),
+    ("index-down", "", "Index: move down"),
+    ("index-up", "", "Index: move up"),
+    ("index-expand", "", "Index: expand entry"),
+    ("index-collapse", "", "Index: collapse entry"),
+    ("index-select", "", "Index: jump to entry"),
+    ("index-close", "", "Index: close panel"),
+    ("index-first", "", "Index: first entry"),
+    ("index-last", "", "Index: last entry"),
+    ("set", "OPTION [VALUE]", "Show or change an option"),
+    ("map", "[MODE] KEYS COMMAND", "Bind KEYS to COMMAND"),
+    ("unmap", "[MODE] KEYS", "Remove a binding"),
+    ("open", "PATH", "Open another file"),
+    ("reload", "", "Reload the current file"),
+    ("reload-config", "", "Re-read the config file"),
+    ("source", "", "Re-read the config file"),
 ];
 
-#[derive(Debug, PartialEq, Eq)]
+pub fn describe(name: &str) -> &'static str {
+    COMMANDS.iter().find(|c| c.0 == name).map_or("", |c| c.2)
+}
+
+/// Parse a command line such as `goto 5` or `map x zoom-in`.
+pub fn parse(line: &str) -> Result<Command, String> {
+    let words = crate::config::tokenize(line)?;
+    let Some((name, args)) = words.split_first() else { return Err("empty command".into()) };
+    parse_words(name, args)
+}
+
+pub fn parse_words(name: &str, args: &[String]) -> Result<Command, String> {
+    let one = || args.first().cloned().ok_or_else(|| format!("{name}: missing argument"));
+    let rest = || {
+        if args.is_empty() { Err(format!("{name}: missing argument")) } else { Ok(args.join(" ")) }
+    };
+    use Command::*;
+    Ok(match name {
+        "scroll-down" => ScrollDown,
+        "scroll-up" => ScrollUp,
+        "scroll-left" => ScrollLeft,
+        "scroll-right" => ScrollRight,
+        "half-page-down" => HalfPageDown,
+        "half-page-up" => HalfPageUp,
+        "next-page" => NextPage,
+        "prev-page" => PrevPage,
+        "first-page" => FirstPage,
+        "last-page" => LastPage,
+        "goto" => Goto(one()?.parse().map_err(|_| "goto: not a page number".to_string())?),
+        "zoom-in" => ZoomIn,
+        "zoom-out" => ZoomOut,
+        "zoom-reset" => ZoomReset,
+        "zoom" => Zoom(one()?.trim_end_matches('%').parse().map_err(|_| "zoom: not a number".to_string())?),
+        "fit-width" => FitWidth,
+        "fit-page" => FitPage,
+        "toggle-recolor" => ToggleRecolor,
+        "toggle-statusbar" => ToggleStatusbar,
+        "quit" | "q" => Quit,
+        "command-mode" => CommandMode,
+        "search-forward" => SearchForward,
+        "search-backward" => SearchBackward,
+        "search" => Search(rest()?),
+        "bsearch" => BSearch(rest()?),
+        "search-next" => SearchNext,
+        "search-prev" => SearchPrev,
+        "nohl" => ClearHighlight,
+        "follow" => Follow,
+        "jump-back" => JumpBack,
+        "jump-forward" => JumpForward,
+        "help" => Help,
+        "index" => Index,
+        "index-down" => IndexDown,
+        "index-up" => IndexUp,
+        "index-expand" => IndexExpand,
+        "index-collapse" => IndexCollapse,
+        "index-select" => IndexSelect,
+        "index-close" => IndexClose,
+        "index-first" => IndexFirst,
+        "index-last" => IndexLast,
+        "set" => Set(one()?, args.get(1).cloned()),
+        "map" | "unmap" => {
+            let (mode, a) = match args.first().and_then(|m| Mode::from_name(m)) {
+                Some(m) => (m, &args[1..]),
+                None => (Mode::Normal, args),
+            };
+            let keys = a.first().cloned().ok_or_else(|| format!("{name}: missing keys"))?;
+            if name == "unmap" {
+                Unmap(mode, keys)
+            } else if a.len() < 2 {
+                return Err("map: missing command".into());
+            } else {
+                let cmd = a[1..].join(" ");
+                parse(&cmd)?; // validate now
+                Map(mode, keys, cmd)
+            }
+        }
+        "open" => Open(rest()?),
+        "reload" => Reload,
+        "reload-config" | "source" => ReloadConfig,
+        _ => return Err(format!("not a command: {name}")),
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct Binding {
+    pub keys: String,
+    pub mode: Mode,
+    pub command: Command,
+    /// Command line text as written (for the help overlay).
+    pub text: String,
+    pub description: String,
+}
+
+/// Key tokens: plain characters ("j", "G", "+"), "<C-x>", "<Space>", "<S-Space>", "<CR>", "<Tab>", "<Esc>", arrows ("<Up>"), "<F1>".
+const DEFAULTS: &[(Mode, &str, &str)] = &[
+    (Mode::Normal, "j", "scroll-down"),
+    (Mode::Normal, "k", "scroll-up"),
+    (Mode::Normal, "h", "scroll-left"),
+    (Mode::Normal, "l", "scroll-right"),
+    (Mode::Normal, "<Down>", "scroll-down"),
+    (Mode::Normal, "<Up>", "scroll-up"),
+    (Mode::Normal, "<Left>", "scroll-left"),
+    (Mode::Normal, "<Right>", "scroll-right"),
+    (Mode::Normal, "<C-d>", "half-page-down"),
+    (Mode::Normal, "<C-u>", "half-page-up"),
+    (Mode::Normal, "J", "next-page"),
+    (Mode::Normal, "K", "prev-page"),
+    (Mode::Normal, "<Space>", "next-page"),
+    (Mode::Normal, "<S-Space>", "prev-page"),
+    (Mode::Normal, "gg", "first-page"),
+    (Mode::Normal, "G", "last-page"),
+    (Mode::Normal, "+", "zoom-in"),
+    (Mode::Normal, "-", "zoom-out"),
+    (Mode::Normal, "=", "zoom-reset"),
+    (Mode::Normal, "s", "fit-width"),
+    (Mode::Normal, "a", "fit-page"),
+    (Mode::Normal, "<C-r>", "toggle-recolor"),
+    (Mode::Normal, "<C-n>", "toggle-statusbar"),
+    (Mode::Normal, ":", "command-mode"),
+    (Mode::Normal, "/", "search-forward"),
+    (Mode::Normal, "?", "search-backward"),
+    (Mode::Normal, "n", "search-next"),
+    (Mode::Normal, "N", "search-prev"),
+    (Mode::Normal, "<Esc>", "nohl"),
+    (Mode::Normal, "f", "follow"),
+    (Mode::Normal, "<C-o>", "jump-back"),
+    (Mode::Normal, "<C-i>", "jump-forward"),
+    (Mode::Normal, "<F1>", "help"),
+    (Mode::Normal, "<Tab>", "index"),
+    (Mode::Normal, "q", "quit"),
+    (Mode::Index, "j", "index-down"),
+    (Mode::Index, "k", "index-up"),
+    (Mode::Index, "<Down>", "index-down"),
+    (Mode::Index, "<Up>", "index-up"),
+    (Mode::Index, "l", "index-expand"),
+    (Mode::Index, "<Right>", "index-expand"),
+    (Mode::Index, "h", "index-collapse"),
+    (Mode::Index, "<Left>", "index-collapse"),
+    (Mode::Index, "<CR>", "index-select"),
+    (Mode::Index, "gg", "index-first"),
+    (Mode::Index, "G", "index-last"),
+    (Mode::Index, "<Tab>", "index-close"),
+    (Mode::Index, "<Esc>", "index-close"),
+    (Mode::Index, "q", "index-close"),
+];
+
+pub struct Keymap {
+    pub bindings: Vec<Binding>,
+}
+
+#[derive(Debug, PartialEq)]
 pub enum Match {
     Exact(Command),
     /// A longer binding starts with the pending keys.
@@ -72,16 +285,42 @@ pub enum Match {
     None,
 }
 
-/// Look up the pending key sequence (tokens concatenated) in `mode`.
-pub fn lookup(mode: Mode, pending: &str) -> Match {
-    let mut prefix = false;
-    for bd in BINDINGS.iter().filter(|bd| bd.mode == mode) {
-        if bd.keys == pending {
-            return Match::Exact(bd.command);
+impl Keymap {
+    pub fn with_defaults() -> Self {
+        let mut km = Keymap { bindings: Vec::new() };
+        for &(mode, keys, text) in DEFAULTS {
+            km.bind(mode, keys, text).expect("default binding parses");
         }
-        prefix |= bd.keys.starts_with(pending);
+        km
     }
-    if prefix { Match::Prefix } else { Match::None }
+
+    pub fn bind(&mut self, mode: Mode, keys: &str, text: &str) -> Result<(), String> {
+        let command = parse(text)?;
+        let name = text.split_whitespace().next().unwrap_or("");
+        let b = Binding { keys: keys.into(), mode, command, text: text.into(), description: describe(name).into() };
+        match self.bindings.iter_mut().find(|x| x.mode == mode && x.keys == keys) {
+            Some(slot) => *slot = b,
+            None => self.bindings.push(b),
+        }
+        Ok(())
+    }
+
+    pub fn unbind(&mut self, mode: Mode, keys: &str) -> bool {
+        let n = self.bindings.len();
+        self.bindings.retain(|b| !(b.mode == mode && b.keys == keys));
+        n != self.bindings.len()
+    }
+
+    pub fn lookup(&self, mode: Mode, pending: &str) -> Match {
+        let mut prefix = false;
+        for b in self.bindings.iter().filter(|b| b.mode == mode) {
+            if b.keys == pending {
+                return Match::Exact(b.command.clone());
+            }
+            prefix |= b.keys.starts_with(pending);
+        }
+        if prefix { Match::Prefix } else { Match::None }
+    }
 }
 
 /// Accumulates counts and key tokens between commands.
@@ -97,8 +336,13 @@ impl KeyState {
         self.count = None;
     }
 
+    /// Text for the statusbar: count and partial key sequence.
+    pub fn display(&self) -> String {
+        format!("{}{}", self.count.map(|c| c.to_string()).unwrap_or_default(), self.pending)
+    }
+
     /// Feed one key token. Returns a command and its count when a binding completes.
-    pub fn feed(&mut self, mode: Mode, token: &str) -> Option<(Command, Option<u32>)> {
+    pub fn feed(&mut self, km: &Keymap, mode: Mode, token: &str) -> Option<(Command, Option<u32>)> {
         if self.pending.is_empty() && token.len() == 1 {
             let d = token.as_bytes()[0];
             if d.is_ascii_digit() && (d != b'0' || self.count.is_some()) {
@@ -108,7 +352,7 @@ impl KeyState {
             }
         }
         self.pending.push_str(token);
-        match lookup(mode, &self.pending) {
+        match km.lookup(mode, &self.pending) {
             Match::Exact(cmd) => {
                 let count = self.count;
                 self.clear();
@@ -129,25 +373,55 @@ mod tests {
 
     #[test]
     fn counts_and_sequences() {
+        let km = Keymap::with_defaults();
         let mut k = KeyState::default();
-        assert_eq!(k.feed(Mode::Normal, "5"), None);
-        assert_eq!(k.feed(Mode::Normal, "j"), Some((Command::ScrollDown, Some(5))));
-        assert_eq!(k.feed(Mode::Normal, "2"), None);
-        assert_eq!(k.feed(Mode::Normal, "0"), None);
-        assert_eq!(k.feed(Mode::Normal, "G"), Some((Command::GotoLast, Some(20))));
-        assert_eq!(k.feed(Mode::Normal, "g"), None);
-        assert_eq!(k.feed(Mode::Normal, "g"), Some((Command::GotoFirst, None)));
-        assert_eq!(k.feed(Mode::Normal, "g"), None);
-        assert_eq!(k.feed(Mode::Normal, "x"), None); // aborted sequence
-        assert_eq!(k.feed(Mode::Normal, "q"), Some((Command::Quit, None)));
+        let n = Mode::Normal;
+        assert_eq!(k.feed(&km, n, "5"), None);
+        assert_eq!(k.feed(&km, n, "j"), Some((Command::ScrollDown, Some(5))));
+        assert_eq!(k.feed(&km, n, "2"), None);
+        assert_eq!(k.feed(&km, n, "0"), None);
+        assert_eq!(k.feed(&km, n, "G"), Some((Command::LastPage, Some(20))));
+        assert_eq!(k.feed(&km, n, "g"), None);
+        assert_eq!(k.display(), "g");
+        assert_eq!(k.feed(&km, n, "g"), Some((Command::FirstPage, None)));
+        assert_eq!(k.feed(&km, n, "g"), None);
+        assert_eq!(k.feed(&km, n, "x"), None);
+        assert_eq!(k.feed(&km, n, "q"), Some((Command::Quit, None)));
     }
 
     #[test]
-    fn no_duplicate_bindings() {
-        for (i, a) in BINDINGS.iter().enumerate() {
-            for c in &BINDINGS[i + 1..] {
-                assert!(!(a.mode == c.mode && a.keys == c.keys), "{}", a.keys);
-            }
+    fn map_unmap_and_modes() {
+        let mut km = Keymap::with_defaults();
+        km.bind(Mode::Normal, "x", "goto 5").unwrap();
+        assert_eq!(km.lookup(Mode::Normal, "x"), Match::Exact(Command::Goto(5)));
+        assert_eq!(km.lookup(Mode::Index, "x"), Match::None);
+        km.bind(Mode::Normal, "j", "scroll-up").unwrap(); // override
+        assert_eq!(km.lookup(Mode::Normal, "j"), Match::Exact(Command::ScrollUp));
+        assert!(km.unbind(Mode::Normal, "j"));
+        assert_eq!(km.lookup(Mode::Normal, "j"), Match::None);
+        assert!(km.bind(Mode::Normal, "y", "bogus").is_err());
+    }
+
+    #[test]
+    fn parse_commands() {
+        assert_eq!(parse("goto 7").unwrap(), Command::Goto(7));
+        assert_eq!(parse("set cache-mb 32").unwrap(), Command::Set("cache-mb".into(), Some("32".into())));
+        assert_eq!(parse("map index j index-down").unwrap(), Command::Map(Mode::Index, "j".into(), "index-down".into()));
+        assert_eq!(parse("map <C-x> goto 3").unwrap(), Command::Map(Mode::Normal, "<C-x>".into(), "goto 3".into()));
+        assert!(parse("goto x").is_err());
+        assert!(parse("map x nonsense").is_err());
+    }
+
+    #[test]
+    fn registry_is_consistent() {
+        for (i, a) in COMMANDS.iter().enumerate() {
+            assert!(!a.2.is_empty());
+            assert!(COMMANDS[i + 1..].iter().all(|c| c.0 != a.0), "dup {}", a.0);
+        }
+        let km = Keymap::with_defaults();
+        for (i, a) in km.bindings.iter().enumerate() {
+            assert!(!a.description.is_empty(), "{}", a.text);
+            assert!(km.bindings[i + 1..].iter().all(|c| !(c.mode == a.mode && c.keys == a.keys)));
         }
     }
 }

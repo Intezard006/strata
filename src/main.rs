@@ -1,8 +1,13 @@
 mod app;
+mod config;
 mod keys;
 mod layout;
+mod links;
 mod recolor;
 mod render;
+mod search;
+mod text;
+mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -15,6 +20,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let path = PathBuf::from(arg);
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
     let event_loop = match EventLoop::<()>::with_user_event().build() {
         Ok(e) => e,
         Err(e) => {
@@ -30,8 +36,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut app = app::App::new(handle, layout::Layout::new(sizes), name);
+    let mut app = app::App::new(handle, sizes, path);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("strata: {e}");
         return ExitCode::FAILURE;

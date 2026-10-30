@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 mupdf = { version = "0.8.0", default-features = false, features = ["epub","cbz","xps","img","html","base14-fonts"] }
 mupdf-sys = { version = "0.8.0", default-features = false }
+fontdue = { version = "0.9", default-features = false }
 winit = { version = "0.30", default-features = false, features = ["rwh_06","wayland","wayland-dlopen"] }
 softbuffer = { version = "0.4", default-features = false, features = ["wayland","wayland-dlopen"] }
 

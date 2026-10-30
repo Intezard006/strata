@@ -2,7 +2,7 @@
 
 use std::ops::RangeInclusive;
 
-/// Gap between pages, in points.
+#[cfg(test)]
 pub const GAP: f32 = 8.0;
 /// Upper bound on pixels per cached tile; taller pages are split into strips.
 pub const MAX_TILE_PX: u64 = 4 * 1024 * 1024;
@@ -16,17 +16,21 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn new(sizes: Vec<(f32, f32)>) -> Self {
+    pub fn new(sizes: Vec<(f32, f32)>, gap: f32) -> Self {
         let mut tops = Vec::with_capacity(sizes.len());
         let mut y = 0.0;
         let mut max_w: f32 = 0.0;
         for &(w, h) in &sizes {
             tops.push(y);
-            y += h + GAP;
+            y += h + gap;
             max_w = max_w.max(w);
         }
-        let total_h = (y - GAP).max(0.0);
+        let total_h = (y - gap).max(0.0);
         Layout { sizes, tops, max_w, total_h }
+    }
+
+    pub fn sizes(&self) -> &[(f32, f32)] {
+        &self.sizes
     }
 
     pub fn len(&self) -> usize {
@@ -85,7 +89,7 @@ mod tests {
     use super::*;
 
     fn lay() -> Layout {
-        Layout::new(vec![(100.0, 200.0), (150.0, 100.0), (100.0, 200.0)])
+        Layout::new(vec![(100.0, 200.0), (150.0, 100.0), (100.0, 200.0)], GAP)
     }
 
     #[test]

@@ -8,11 +8,13 @@ pub struct Recolor {
     pub dark: [u8; 3],
     /// Keep the hue of strongly coloured ink instead of forcing it to `dark`.
     pub keephue: bool,
+    /// Paper colour; alpha 0 leaves the page transparent so the window background shows.
+    pub light: [u8; 4],
 }
 
 impl Default for Recolor {
     fn default() -> Self {
-        Recolor { enabled: true, dark: [0xff, 0xff, 0xff], keephue: false }
+        Recolor { enabled: true, dark: [0xff, 0xff, 0xff], keephue: false, light: [0; 4] }
     }
 }
 
@@ -28,6 +30,11 @@ fn pack(r: u32, g: u32, b: u32, a: u32) -> u32 {
 }
 
 impl Recolor {
+    pub fn with_enabled(mut self, on: bool) -> Self {
+        self.enabled = on;
+        self
+    }
+
     /// Convert one premultiplied RGBA pixel (as produced by MuPDF) to premultiplied 0xAARRGGBB.
     pub fn pixel(&self, r: u8, g: u8, b: u8, a: u8) -> u32 {
         if a == 0 {
@@ -49,7 +56,16 @@ impl Recolor {
                 return pack(ur, ug, ub, alpha);
             }
         }
-        pack(self.dark[0] as u32, self.dark[1] as u32, self.dark[2] as u32, ink)
+        let [dr, dg, db] = self.dark.map(|c| c as u32);
+        let la = self.light[3] as u32;
+        if la == 0 {
+            return pack(dr, dg, db, ink);
+        }
+        // blend ink over the (partly transparent) paper colour, premultiplied
+        let paper = mul255(a - ink, la);
+        let ch = |d: u32, l: u8| mul255(d, ink) + mul255(l as u32, paper);
+        let alpha = ink + paper;
+        (alpha << 24) | (ch(dr, self.light[0]).min(alpha) << 16) | (ch(dg, self.light[1]).min(alpha) << 8) | ch(db, self.light[2]).min(alpha)
     }
 }
 
@@ -67,6 +83,13 @@ mod tests {
         assert_eq!(Recolor::default().pixel(0, 0, 0, 255), 0xffff_ffff);
         let rc = Recolor { dark: [0x10, 0x20, 0x30], ..Recolor::default() };
         assert_eq!(rc.pixel(0, 0, 0, 255), 0xff10_2030);
+    }
+
+    #[test]
+    fn opaque_paper_color_fills_page() {
+        let rc = Recolor { light: [0x1e, 0x1e, 0x2e, 0xff], ..Recolor::default() };
+        assert_eq!(rc.pixel(255, 255, 255, 255), 0xff1e_1e2e);
+        assert_eq!(rc.pixel(0, 0, 0, 255), 0xffff_ffff);
     }
 
     #[test]
