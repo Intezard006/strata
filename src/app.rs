@@ -29,11 +29,12 @@ use crate::render::{Cmd, PreviewReq, RenderHandle, Request, Response, SearchReq,
 use crate::search::{case_sensitive, Hit, Search};
 use crate::text::TextRenderer;
 use crate::ui::help::Help;
-use crate::ui::pick::{self, Pick, PickItem, PickKind};
+use crate::ui::pick::{self, Act, Group, Pick, PickItem, PickKind};
 use crate::ui::plist::{self, PList};
 use crate::db::{self, Db};
 use crate::ext::{self, Ext, SharedInfo};
 use crate::synctex;
+use crate::pages;
 use crate::ui::popup::{self, Popup};
 use crate::ui::index::{self, Index, Item};
 use crate::worker::{Job, Msg};
@@ -621,10 +622,74 @@ impl App {
 
     fn open_blist(&mut self) {
         let items: Vec<PickItem> = match (&self.db, &self.key) {
-            (Some(db), Some(key)) => db.bookmarks(key).into_iter().map(|(n, p, _)| PickItem { label: n.clone(), detail: String::new(), right: format!("p.{}", p + 1), arg: n }).collect(),
+            (Some(db), Some(key)) => db.bookmarks(key).into_iter().map(|(n, p, _)| PickItem { label: n.clone(), detail: String::new(), right: format!("p.{}", p + 1), act: Act::Bookmark(n), group: Group::Plain, bonus: 0 }).collect(),
             _ => Vec::new(),
         };
         self.overlay = Overlay::Pick(Pick::new(PickKind::Bookmarks, "Bookmarks", items));
+    }
+
+    fn run_act(&mut self, a: Act, el: &ActiveEventLoop) {
+        match a {
+            Act::Bookmark(n) => self.exec(Command::Bjump(n), None, el),
+            Act::Open(path) => self.exec(Command::Open(path), None, el),
+            Act::Goto(page, y) => {
+                self.jumps.push(self.sy);
+                self.goto_page_y(page as usize, Some(y));
+            }
+            Act::Command { name, needs_args } => {
+                if needs_args {
+                    let mut bar = InputBar::new(':');
+                    for c in format!("{name} ").chars() {
+                        bar.insert(c);
+                    }
+                    self.overlay = Overlay::Input(bar);
+                } else {
+                    match keys::parse(name) {
+                        Ok(c) => self.exec(c, None, el),
+                        Err(e) => self.err(e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The command palette: every item list is built here and dropped with the overlay.
+    fn open_palette(&mut self) {
+        let mut items: Vec<PickItem> = Vec::new();
+        let map = self.analysis.as_ref().map(|a| &a.page_map);
+        for &(name, args, desc) in keys::COMMANDS {
+            if matches!(name, "mark-prompt" | "jump-mark-prompt" | "palette") {
+                continue;
+            }
+            let key = self.keymap.bindings.iter().find(|b| b.mode == Mode::Normal && b.text.split_whitespace().next() == Some(name)).map(|b| b.keys.clone());
+            let needs_args = args.split_whitespace().any(|w| !w.starts_with('['));
+            let label = if args.is_empty() { name.to_string() } else { format!("{name} {args}") };
+            items.push(PickItem { label, detail: desc.to_string(), right: key.unwrap_or_default(), act: Act::Command { name, needs_args }, group: Group::Command, bonus: 0 });
+        }
+        for it in &self.index.items {
+            if let (Some(p), y) = (it.page, it.y) {
+                items.push(PickItem { label: it.title.clone(), detail: String::new(), right: format!("p.{}", pages::label(map, p)), act: Act::Goto(p, y.unwrap_or(0.0)), group: Group::Index, bonus: 0 });
+            }
+        }
+        if let (Some(db), Some(key)) = (&self.db, &self.key) {
+            for (n, p, y) in db.bookmarks(key) {
+                items.push(PickItem { label: n.clone(), detail: String::new(), right: format!("p.{}", pages::label(map, p)), act: Act::Bookmark(n), group: Group::Bookmark, bonus: 0 });
+                let _ = y;
+            }
+        }
+        if let Some(pv) = &self.pv {
+            for t in pv.targets.iter().filter(|t| t.kind != Kind::Link) {
+                items.push(PickItem { label: format!("{} {}", t.kind.name(), t.label), detail: t.text.clone(), right: format!("p.{}", pages::label(map, t.page)), act: Act::Goto(t.page, t.rect[1]), group: Group::Preview, bonus: 0 });
+            }
+        }
+        if let Some(db) = &self.db {
+            for (i, (p, t)) in db.recent(30).into_iter().enumerate() {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let dir = p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+                items.push(PickItem { label: name, detail: dir, right: ago(t), act: Act::Open(p.to_string_lossy().into_owned()), group: Group::Recent, bonus: (15 - i as i32).max(0) });
+            }
+        }
+        self.overlay = Overlay::Pick(Pick::new(PickKind::Palette, "Palette", items));
     }
 
     fn open_recent(&mut self) {
@@ -632,7 +697,7 @@ impl App {
             Some(db) => db.recent(60).into_iter().map(|(p, t)| {
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let dir = p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-                PickItem { label: name, detail: dir, right: ago(t), arg: p.to_string_lossy().into_owned() }
+                PickItem { label: name, detail: dir, right: ago(t), act: Act::Open(p.to_string_lossy().into_owned()), group: Group::Plain, bonus: 0 }
             }).collect(),
             None => Vec::new(),
         };
@@ -838,6 +903,7 @@ impl App {
             }
             Command::Bmark(n) => self.bookmark_here(n),
             Command::Blist => self.open_blist(),
+            Command::Palette => self.open_palette(),
             Command::Recent => self.open_recent(),
             Command::Bdelete(n) => {
                 let ok = matches!((&self.db, &self.key), (Some(d), Some(k)) if d.delete_bookmark(k, &n));
@@ -1321,8 +1387,7 @@ impl App {
                     if pk.query.is_empty() {
                         self.overlay = Overlay::None;
                     } else {
-                        pk.query.clear();
-                        pk.sel = 0;
+                        pk.clear_query();
                     }
                 }
                 "<BS>" => pk.backspace(),
@@ -1331,12 +1396,10 @@ impl App {
                 "<PgDn>" | "<C-d>" => pk.move_sel(10),
                 "<PgUp>" | "<C-u>" => pk.move_sel(-10),
                 "<CR>" => {
-                    let act = pk.current().map(|i| (pk.kind, i.arg.clone()));
-                    self.overlay = Overlay::None;
-                    match act {
-                        Some((PickKind::Bookmarks, n)) => self.exec(Command::Bjump(n), None, el),
-                        Some((PickKind::Recent, path)) => self.exec(Command::Open(path), None, el),
-                        None => {}
+                    let act = pk.current().map(|i| i.act.clone());
+                    self.overlay = Overlay::None; // drops the item list
+                    if let Some(a) = act {
+                        self.run_act(a, el);
                     }
                 }
                 _ => {
@@ -1638,7 +1701,11 @@ impl App {
             (Overlay::Help(_), _) => "HELP",
             (Overlay::Hints(_), _) => "HINTS",
             (Overlay::List(_), _) => "PREVIEWS",
-            (Overlay::Pick(p), _) => if p.kind == PickKind::Bookmarks { "BOOKMARKS" } else { "RECENT" },
+            (Overlay::Pick(p), _) => match p.kind {
+                PickKind::Bookmarks => "BOOKMARKS",
+                PickKind::Recent => "RECENT",
+                PickKind::Palette => "PALETTE",
+            },
             (_, Mode::Popup) => "PREVIEW",
             (_, Mode::Index) => "INDEX",
             _ => "NORMAL",
