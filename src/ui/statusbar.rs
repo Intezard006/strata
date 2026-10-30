@@ -7,6 +7,8 @@ pub struct Status<'a> {
     pub name: &'a str,
     pub message: Option<(&'a str, bool)>,
     pub page: usize,
+    /// Printed page label when the book has a page map.
+    pub printed: Option<&'a str>,
     pub total: usize,
     pub zoom_pct: u32,
     pub mode: &'a str,
@@ -36,6 +38,9 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, s: &Status) {
     }
     if let Some(j) = s.job {
         right.push_str(&format!("{j}  "));
+    }
+    if let Some(p) = s.printed {
+        right.push_str(&format!("p.{p} "));
     }
     right.push_str(&format!("[{}/{}]  {}%  {}", s.page, s.total, s.zoom_pct, s.mode));
     let rw = t.width(&right);

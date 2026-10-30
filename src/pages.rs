@@ -147,7 +147,6 @@ pub fn detect(per_page: &[Vec<Cand>]) -> PageMap {
 }
 
 impl PageMap {
-    #[allow(dead_code)] // used by the printed-page :goto (phase 6)
     /// Printed label of PDF page `p` (0-based), e.g. `"25"` or `"xii"`.
     pub fn pdf_to_printed(&self, p: u32) -> Option<String> {
         let s = self.segments.iter().find(|s| p >= s.start && p < s.end)?;
@@ -166,6 +165,55 @@ impl PageMap {
         // beyond a run's last numbered page: use the latest run starting before the target
         segs().filter(|s| at(s).is_some_and(|p| p >= s.start)).max_by_key(|s| s.start).and_then(at)
     }
+}
+
+/// What `:goto` was given.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum GotoArg {
+    /// `#120`: a PDF page, 1-based.
+    Pdf(u32),
+    /// `120`: a printed page when a map exists, else a PDF page.
+    Number(u32),
+    /// `xii`: a roman-numbered (front matter) page.
+    Roman(u32),
+}
+
+pub fn parse_goto(s: &str) -> Result<GotoArg, String> {
+    let s = s.trim();
+    if let Some(n) = s.strip_prefix('#') {
+        return n.trim().parse().map(GotoArg::Pdf).map_err(|_| format!("goto: bad PDF page: {s}"));
+    }
+    if let Ok(n) = s.parse::<u32>() {
+        return Ok(GotoArg::Number(n));
+    }
+    roman_value(&s.to_ascii_lowercase()).map(GotoArg::Roman).ok_or_else(|| format!("goto: not a page: {s}"))
+}
+
+/// Resolve to a 0-based PDF page and an optional statusbar note (when a fallback was used).
+pub fn resolve_goto(map: Option<&PageMap>, arg: GotoArg, printed: bool, total: u32) -> Result<(u32, Option<String>), String> {
+    let last = total.saturating_sub(1);
+    let pdf = |n: u32| (n.max(1) - 1).min(last);
+    let map = map.filter(|m| !m.segments.is_empty());
+    match arg {
+        GotoArg::Pdf(n) => Ok((pdf(n), None)),
+        GotoArg::Number(n) => match (printed, map) {
+            (true, Some(m)) => match m.printed_to_pdf(n, false).filter(|&p| p <= last) {
+                Some(p) => Ok((p, None)),
+                None => Ok((pdf(n), Some(format!("printed page {n} not found; went to PDF page {}", pdf(n) + 1)))),
+            },
+            (true, None) => Ok((pdf(n), Some("no printed page numbers detected; went to PDF page".into()))),
+            (false, _) => Ok((pdf(n), None)),
+        },
+        GotoArg::Roman(n) => match map.and_then(|m| m.printed_to_pdf(n, true)).filter(|&p| p <= last) {
+            Some(p) => Ok((p, None)),
+            None => Err(format!("no roman page {} in this document", to_roman(n))),
+        },
+    }
+}
+
+/// Page label for lists: the printed number when mapped, else the PDF page number.
+pub fn label(map: Option<&PageMap>, p: u32) -> String {
+    map.and_then(|m| m.pdf_to_printed(p)).unwrap_or_else(|| (p + 1).to_string())
 }
 
 #[cfg(test)]
@@ -219,5 +267,30 @@ mod tests {
             assert_eq!(roman_value(&to_roman(n)), Some(n));
         }
         assert_eq!(roman_value("Ii"), None);
+    }
+
+    #[test]
+    fn goto_parsing_and_mapping() {
+        assert_eq!(parse_goto("120"), Ok(GotoArg::Number(120)));
+        assert_eq!(parse_goto("#120"), Ok(GotoArg::Pdf(120)));
+        assert_eq!(parse_goto("xii"), Ok(GotoArg::Roman(12)));
+        assert_eq!(parse_goto("XII"), Ok(GotoArg::Roman(12)));
+        assert!(parse_goto("zz").is_err());
+        assert!(parse_goto("#x").is_err());
+        let m = detect(&book()); // arabic page 1 is PDF page 7
+        let go = |a, pr| resolve_goto(Some(&m), a, pr, 26);
+        assert_eq!(go(GotoArg::Number(3), true), Ok((8, None)));
+        assert_eq!(go(GotoArg::Number(3), false), Ok((2, None)), "option off: PDF page");
+        assert_eq!(go(GotoArg::Pdf(3), true), Ok((2, None)));
+        assert_eq!(go(GotoArg::Roman(4), true), Ok((3, None)));
+        let (p, note) = go(GotoArg::Number(500), true).unwrap();
+        assert_eq!(p, 25, "beyond the book clamps to the last page");
+        assert!(note.is_some());
+        assert!(resolve_goto(None, GotoArg::Roman(4), true, 26).is_err());
+        let (p, note) = resolve_goto(None, GotoArg::Number(9), true, 26).unwrap();
+        assert_eq!((p, note.is_some()), (8, true), "unmapped: PDF page plus a note");
+        assert_eq!(resolve_goto(Some(&PageMap::default()), GotoArg::Number(9), true, 26).unwrap().0, 8);
+        assert_eq!(label(Some(&m), 6), "1");
+        assert_eq!(label(None, 6), "7");
     }
 }

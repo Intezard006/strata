@@ -37,7 +37,8 @@ pub enum Command {
     FirstPage,
     /// Last page, or page N with a count.
     LastPage,
-    Goto(u32),
+    /// Raw argument: `120`, `#120` or `xii` (resolved by the app against the page map).
+    Goto(String),
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -115,7 +116,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("prev-page", "", "Previous page"),
     ("first-page", "", "First page (or page N with a count)"),
     ("last-page", "", "Last page (or page N with a count)"),
-    ("goto", "N", "Go to page N"),
+    ("goto", "N|#N|ROMAN", "Go to printed page N (#N: PDF page, xii: roman front matter)"),
     ("zoom-in", "", "Zoom in"),
     ("zoom-out", "", "Zoom out"),
     ("zoom-reset", "", "Reset zoom to 100%"),
@@ -207,7 +208,11 @@ pub fn parse_words(name: &str, args: &[String]) -> Result<Command, String> {
         "prev-page" => PrevPage,
         "first-page" => FirstPage,
         "last-page" => LastPage,
-        "goto" => Goto(one()?.parse().map_err(|_| "goto: not a page number".to_string())?),
+        "goto" => {
+            let a = one()?;
+            crate::pages::parse_goto(&a)?;
+            Goto(a)
+        }
         "zoom-in" => ZoomIn,
         "zoom-out" => ZoomOut,
         "zoom-reset" => ZoomReset,
@@ -500,7 +505,7 @@ mod tests {
     fn map_unmap_and_modes() {
         let mut km = Keymap::with_defaults();
         km.bind(Mode::Normal, "x", "goto 5").unwrap();
-        assert_eq!(km.lookup(Mode::Normal, "x"), Match::Exact(Command::Goto(5)));
+        assert_eq!(km.lookup(Mode::Normal, "x"), Match::Exact(Command::Goto("5".into())));
         assert_eq!(km.lookup(Mode::Index, "x"), Match::None);
         km.bind(Mode::Normal, "j", "scroll-up").unwrap(); // override
         assert_eq!(km.lookup(Mode::Normal, "j"), Match::Exact(Command::ScrollUp));
@@ -511,11 +516,11 @@ mod tests {
 
     #[test]
     fn parse_commands() {
-        assert_eq!(parse("goto 7").unwrap(), Command::Goto(7));
+        assert_eq!(parse("goto 7").unwrap(), Command::Goto("7".into()));
         assert_eq!(parse("set cache-mb 32").unwrap(), Command::Set("cache-mb".into(), Some("32".into())));
         assert_eq!(parse("map index j index-down").unwrap(), Command::Map(Mode::Index, "j".into(), "index-down".into()));
         assert_eq!(parse("map <C-x> goto 3").unwrap(), Command::Map(Mode::Normal, "<C-x>".into(), "goto 3".into()));
-        assert!(parse("goto x").is_err());
+        assert!(parse("goto zz").is_err());
         assert!(parse("map x nonsense").is_err());
     }
 

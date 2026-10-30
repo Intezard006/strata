@@ -739,6 +739,20 @@ impl App {
         (1.0 + self.cfg.zoom_step / 100.0).powi(n)
     }
 
+    fn goto_arg(&mut self, g: crate::pages::GotoArg) {
+        let map = self.analysis.as_ref().map(|a| &a.page_map);
+        match crate::pages::resolve_goto(map, g, self.cfg.goto_printed, self.layout.len() as u32) {
+            Ok((p, note)) => {
+                self.jumps.push(self.sy);
+                self.goto_page(p as usize);
+                if let Some(n) = note {
+                    self.err(n);
+                }
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
     fn goto_page(&mut self, p: usize) {
         self.sy = self.layout.top(p.min(self.layout.len() - 1));
         self.clamp_scroll();
@@ -784,12 +798,13 @@ impl App {
             Command::HalfPageUp => self.scroll_by(0.0, -(self.doc_h() as f32) / 2.0 * n as f32),
             Command::NextPage => self.goto_page((self.current_page() + n as usize).min(self.layout.len() - 1)),
             Command::PrevPage => self.goto_page(self.current_page().saturating_sub(n as usize)),
-            Command::FirstPage => self.goto_page(count.map_or(0, |c| c.max(1) as usize - 1)),
-            Command::LastPage => self.goto_page(count.map_or(self.layout.len() - 1, |c| c.max(1) as usize - 1)),
-            Command::Goto(p) => {
-                self.jumps.push(self.sy);
-                self.goto_page(p.max(1) as usize - 1);
-            }
+            Command::FirstPage | Command::LastPage if count.is_some() => self.goto_arg(crate::pages::GotoArg::Number(n)),
+            Command::FirstPage => self.goto_page(0),
+            Command::LastPage => self.goto_page(self.layout.len() - 1),
+            Command::Goto(a) => match crate::pages::parse_goto(&a) {
+                Ok(g) => self.goto_arg(g),
+                Err(e) => self.err(e),
+            },
             Command::ZoomIn => self.set_zoom(self.zoom * self.zoom_factor(n as i32)),
             Command::ZoomOut => self.set_zoom(self.zoom / self.zoom_factor(n as i32)),
             Command::ZoomReset => self.set_zoom(1.0),
@@ -1616,6 +1631,7 @@ impl App {
         let msg = self.message.clone();
         let pending_keys = self.keys.display();
         let page = self.current_page();
+        let printed = self.analysis.as_ref().and_then(|a| a.page_map.pdf_to_printed(page as u32));
         let total = self.layout.len();
         let zoom_pct = (self.zoom * 100.0).round() as u32;
         let mode_name = match (&self.overlay, self.mode) {
@@ -1665,11 +1681,11 @@ impl App {
             if let Overlay::Help(hp) = &self.overlay {
                 help_rows = Some(crate::ui::help::draw(&mut cv, t, hp, bar));
             } else if let (Overlay::List(l), Some(pv)) = (&mut self.overlay, &self.pv) {
-                plist::draw(&mut cv, t, l, &pv.targets, bar);
+                plist::draw(&mut cv, t, l, &pv.targets, self.analysis.as_ref().map(|a| &a.page_map), bar);
             } else if let Overlay::Pick(p) = &mut self.overlay {
                 pick::draw(&mut cv, t, p, bar);
             } else if self.mode == Mode::Index {
-                index_rows = Some(index::draw(&mut cv, t, &mut self.index, index_auto, bar));
+                index_rows = Some(index::draw(&mut cv, t, &mut self.index, index_auto, self.analysis.as_ref().map(|a| &a.page_map), bar));
             }
             if let Some(p) = self.popup.as_mut() {
                 popup::draw(&mut cv, t, p);
@@ -1679,6 +1695,7 @@ impl App {
                     name: &name,
                     message: msg.as_ref().map(|(m, e)| (m.as_str(), *e)),
                     page: page + 1,
+                    printed: printed.as_deref(),
                     total,
                     zoom_pct,
                     mode: mode_name,

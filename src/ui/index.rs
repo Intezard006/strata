@@ -107,7 +107,7 @@ impl Index {
     }
 }
 
-pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, auto: Option<&str>, bottom_reserved: i32) -> usize {
+pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, auto: Option<&str>, map: Option<&crate::pages::PageMap>, bottom_reserved: i32) -> usize {
     cv.fill_rect(0, 0, cv.w, cv.h - bottom_reserved, panel_bg());
     let (lh, cw) = (t.line_h, t.width("M").max(1));
     let pad = cw * 2;
@@ -130,7 +130,7 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, auto: Option<
         let marker = if !it.has_children { "  " } else if ix.expanded.contains(&i) { "v " } else { "> " };
         let x = pad + it.depth as i32 * 2 * cw;
         let x = t.draw(cv, x, y, marker, DIM, cv.w);
-        let page = it.page.map(|p| format!("{}", p + 1)).unwrap_or_default();
+        let page = it.page.map(|p| crate::pages::label(map, p)).unwrap_or_default();
         let pw = t.width(&page) + pad;
         t.draw(cv, x, y, &it.title, FG, (cv.w - x - pw - pad).max(0));
         t.draw(cv, cv.w - pw, y, &page, DIM, pw);

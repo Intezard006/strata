@@ -24,6 +24,7 @@ pub struct Config {
     pub preview_hover_ms: u64,
     pub preview_max_scale: f32,
     pub restore_position: bool,
+    pub goto_printed: bool,
     pub synctex: bool,
     pub synctex_editor_command: String,
 }
@@ -58,6 +59,7 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("preview-hover-ms", "Hover time before a preview popup opens, in ms"),
     ("preview-max-scale", "Maximum render scale of the popup (1 = 100%)"),
     ("restore-position", "Reopen documents at the last position, zoom and recolor state (true/false)"),
+    ("goto-printed", "`:goto N` and `NG` use printed page numbers when the book has them (true/false)"),
     ("synctex", "SyncTeX forward/backward search (true/false)"),
     ("synctex-editor-command", "Run on Ctrl+click; %{input} %{line} %{column} are substituted (quote the value)"),
 ];
@@ -83,6 +85,7 @@ impl Default for Config {
             preview_hover_ms: 300,
             preview_max_scale: 3.0,
             restore_position: true,
+            goto_printed: true,
             synctex: true,
             synctex_editor_command: String::new(),
         }
@@ -169,6 +172,7 @@ impl Config {
             "preview-hover-ms" => self.preview_hover_ms = parse_num(v, 0.0, 5000.0)? as u64,
             "preview-max-scale" => self.preview_max_scale = parse_num(v, 0.5, 8.0)?,
             "restore-position" => self.restore_position = parse_bool(v)?,
+            "goto-printed" => self.goto_printed = parse_bool(v)?,
             "synctex" => self.synctex = parse_bool(v)?,
             "synctex-editor-command" => self.synctex_editor_command = v.to_string(),
             "auto-index" => {
@@ -206,6 +210,7 @@ impl Config {
             "preview-hover-ms" => self.preview_hover_ms.to_string(),
             "preview-max-scale" => self.preview_max_scale.to_string(),
             "restore-position" => self.restore_position.to_string(),
+            "goto-printed" => self.goto_printed.to_string(),
             "synctex" => self.synctex.to_string(),
             "synctex-editor-command" => self.synctex_editor_command.clone(),
             "auto-index" => format!("{:?}", self.auto_index).to_lowercase(),

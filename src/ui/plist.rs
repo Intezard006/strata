@@ -102,7 +102,7 @@ impl PList {
     }
 }
 
-pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, l: &mut PList, targets: &[Target], bottom_reserved: i32) {
+pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, l: &mut PList, targets: &[Target], map: Option<&crate::pages::PageMap>, bottom_reserved: i32) {
     cv.fill_rect(0, 0, cv.w, cv.h - bottom_reserved, panel_bg());
     let lh = t.line_h;
     let cw = t.width("M").max(1);
@@ -136,7 +136,7 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, l: &mut PList, targets: &[Tar
                 }
                 let lab = format!("{} {}", tg.kind.name(), tg.label);
                 let col2 = pad + (cw * 22).min(cv.w / 3);
-                let page = format!("p.{}", tg.page + 1);
+                let page = format!("p.{}", crate::pages::label(map, tg.page));
                 let pw = t.width(&page);
                 t.draw(cv, pad, y, &lab, FG, col2 - pad);
                 t.draw(cv, col2, y, &tg.text, DIM, cv.w - col2 - pw - 3 * pad);
