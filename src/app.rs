@@ -1539,6 +1539,9 @@ impl App {
             return; // moved onto the popup itself
         }
         let key = self.ref_at().map(|(p, i, _)| (p, i));
+        if debug() {
+            eprintln!("hover: cursor {:?} -> {:?}", self.cursor, key);
+        }
         if self.hover.moved(key, Instant::now(), Duration::from_millis(self.cfg.preview_hover_ms)) && self.popup.as_ref().is_some_and(|p| p.hover) {
             self.popup = None;
             self.redraw();
