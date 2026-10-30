@@ -17,6 +17,7 @@ use crate::cache::{self, Analysis, IndexEntry, IndexSource, OcrState};
 use crate::heading::{self, size_key, Line};
 use crate::pages::{self, Cand};
 use crate::toc;
+use crate::{previews, pstore};
 use crate::render::open_doc;
 
 const TEXT_MIN_CHARS: usize = 20;
@@ -50,19 +51,49 @@ struct PageInfo {
     hist: Vec<(u32, u64)>,
     /// Page-number candidates from the first and last two lines.
     edge: Vec<Cand>,
+    /// Words with positions for the preview pass (only when previews are wanted).
+    pin: Option<previews::PageIn>,
+    links: Vec<pstore::RawLink>,
+    size: (f32, f32),
 }
 
-fn analyze_page(doc: &Document, p: usize) -> Option<PageInfo> {
+/// Internal links of a page (destination page and y), for preview targets.
+fn internal_links(page: &mupdf::Page, b: mupdf::Rect) -> Vec<pstore::RawLink> {
+    let Ok(it) = page.links() else { return vec![] };
+    it.filter_map(|l| {
+        let d = l.dest?;
+        let y = match d.kind {
+            mupdf::DestinationKind::XYZ { top, .. } | mupdf::DestinationKind::FitH { top } | mupdf::DestinationKind::FitBH { top } => top.unwrap_or(0.0),
+            mupdf::DestinationKind::FitR { top, .. } => top,
+            _ => 0.0,
+        };
+        Some(pstore::RawLink { page: 0, rect: [l.bounds.x0 - b.x0, l.bounds.y0 - b.y0, l.bounds.x1 - b.x0, l.bounds.y1 - b.y0], dest_page: d.loc.page_number, dest_y: y })
+    })
+    .collect()
+}
+
+fn analyze_page(doc: &Document, p: usize, want: bool) -> Option<PageInfo> {
     let page = doc.load_page(p as i32).ok()?;
     let b = page.bounds().ok()?;
-    let tp = page.to_text_page(TextPageFlags::empty()).ok()?;
+    let tp = page.to_text_page(if want { TextPageFlags::PRESERVE_IMAGES } else { TextPageFlags::empty() }).ok()?;
+    let mut plines: Vec<previews::PLine> = Vec::new();
+    let mut images: Vec<[f32; 4]> = Vec::new();
     let st = tp.structured();
     let mut raw: Vec<RawLine> = Vec::new();
     let mut hist: HashMap<u32, u64> = HashMap::new();
     let mut chars = 0;
     for block in &st.blocks {
+        if let (true, TextBlockContent::Image { .. }) = (want, &block.content) {
+            let r = [block.bounds.x0 - b.x0, block.bounds.y0 - b.y0, block.bounds.x1 - b.x0, block.bounds.y1 - b.y0];
+            if (r[2] - r[0]) * (r[3] - r[1]) < 0.6 * (b.x1 - b.x0) * (b.y1 - b.y0) {
+                images.push(r);
+            }
+        }
         let TextBlockContent::Text { lines } = &block.content else { continue };
         for l in lines {
+            if want {
+                plines.push(previews_line(l, b.x0, b.y0));
+            }
             let mut sizes: HashMap<u32, usize> = HashMap::new();
             let (mut n, mut bold) = (0usize, 0usize);
             for c in l.chars.iter().filter(|c| !c.ch.is_whitespace()) {
@@ -123,7 +154,50 @@ fn analyze_page(doc: &Document, p: usize) -> Option<PageInfo> {
             gap_below: below,
         });
     }
-    Some(PageInfo { chars, short, hist: hist.into_iter().collect(), edge })
+    let (pin, links) = if want {
+        let mut links = internal_links(&page, b);
+        for l in &mut links {
+            l.page = p as u32;
+        }
+        (Some(previews::PageIn { page: p as u32, w: b.x1 - b.x0, h: b.y1 - b.y0, lines: plines, images }), links)
+    } else {
+        (None, Vec::new())
+    };
+    Some(PageInfo { chars, short, hist: hist.into_iter().collect(), edge, pin, links, size: (b.x1 - b.x0, b.y1 - b.y0) })
+}
+
+/// Words of one text line with their horizontal extents.
+fn previews_line(l: &mupdf::StructuredTextLine, ox: f32, oy: f32) -> previews::PLine {
+    let mut words: Vec<previews::W> = Vec::new();
+    let mut cur = String::new();
+    let (mut x0, mut x1) = (f32::MAX, 0f32);
+    let (mut size_sum, mut nchar, mut bold) = (0.0f32, 0usize, 0usize);
+    for c in &l.chars {
+        if c.ch.is_whitespace() {
+            if !cur.is_empty() {
+                words.push(previews::W { t: std::mem::take(&mut cur), x0: x0 - ox, x1: x1 - ox });
+                x0 = f32::MAX;
+                x1 = 0.0;
+            }
+            continue;
+        }
+        bold += c.flags.contains(TextCharFlags::BOLD) as usize;
+        nchar += 1;
+        size_sum += c.size;
+        x0 = x0.min(c.quad.ul.x.min(c.quad.ll.x));
+        x1 = x1.max(c.quad.ur.x.max(c.quad.lr.x));
+        cur.push(c.ch);
+    }
+    if !cur.is_empty() {
+        words.push(previews::W { t: cur, x0: x0 - ox, x1: x1 - ox });
+    }
+    previews::PLine {
+        words,
+        y0: l.bounds.y0 - oy,
+        y1: l.bounds.y1 - oy,
+        size: if nchar > 0 { size_sum / nchar as f32 } else { 10.0 },
+        bold: bold * 2 > nchar,
+    }
 }
 
 /// Scanned = most of ~10 evenly spread pages have (almost) no text.
@@ -132,7 +206,7 @@ fn detect_scanned(doc: &Document, n: usize) -> bool {
     let mut low = 0;
     for i in 0..samples {
         let p = if samples == 1 { 0 } else { i * (n - 1) / (samples - 1) };
-        let chars = analyze_page(doc, p).map_or(0, |i| i.chars);
+        let chars = analyze_page(doc, p, false).map_or(0, |i| i.chars);
         low += (chars < TEXT_MIN_CHARS) as usize;
     }
     low * 2 > samples
@@ -206,7 +280,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let flag = |f: &str| args.iter().any(|a| a == f);
     let cap_mb: u64 = args.iter().position(|a| a == "--cache-max-mb").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(2048);
     install_term_handler();
-    match analyze(&file, flag("--ocr"), flag("--no-ocr"), flag("--force"), cap_mb) {
+    match analyze(&file, flag("--ocr"), flag("--no-ocr"), flag("--force"), cap_mb, !flag("--no-previews")) {
         Ok(()) => {
             say("D");
             ExitCode::SUCCESS
@@ -218,7 +292,7 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
-fn analyze(file: &Path, force_ocr: bool, no_ocr: bool, force: bool, cap_mb: u64) -> Result<(), String> {
+fn analyze(file: &Path, force_ocr: bool, no_ocr: bool, force: bool, cap_mb: u64, want: bool) -> Result<(), String> {
     let dir = cache::dir_for(file).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     cache::touch(&dir);
@@ -267,6 +341,7 @@ fn analyze(file: &Path, force_ocr: bool, no_ocr: bool, force: bool, cap_mb: u64)
     let mut lines: Vec<Line> = Vec::new();
     let mut hist: BTreeMap<u32, u64> = BTreeMap::new();
     let mut edges: Vec<Vec<Cand>> = Vec::with_capacity(n);
+    let (mut sizes, mut targets, mut raw_refs, mut raw_links) = (Vec::with_capacity(n), Vec::new(), Vec::new(), Vec::new());
     for p in 0..n {
         if p > 0 && p % REOPEN_EVERY == 0 {
             // MuPDF keeps every touched page's objects; reopening bounds the child's peak memory
@@ -277,8 +352,15 @@ fn analyze(file: &Path, force_ocr: bool, no_ocr: bool, force: bool, cap_mb: u64)
         if p % PROGRESS_EVERY == 0 {
             say(&format!("P {p} {n}"));
         }
-        match analyze_page(&doc, p) {
+        match analyze_page(&doc, p, want) {
             Some(info) => {
+                sizes.push(info.size);
+                if let Some(pin) = &info.pin {
+                    let (t, r) = previews::extract_page(pin);
+                    targets.extend(t);
+                    raw_refs.extend(r);
+                }
+                raw_links.extend(info.links);
                 has_text.push(info.chars >= TEXT_MIN_CHARS);
                 edges.push(info.edge);
                 lines.extend(info.short);
@@ -289,18 +371,57 @@ fn analyze(file: &Path, force_ocr: bool, no_ocr: bool, force: bool, cap_mb: u64)
             None => {
                 has_text.push(false);
                 edges.push(Vec::new());
+                sizes.push((612.0, 792.0));
             }
         }
     }
     let page_map = pages::detect(&edges);
-    let (index, index_source) = build_index(&lines, n, heading::body_size(&hist), &page_map);
-    let a = Analysis { version: cache::VERSION, pages: n as u32, has_text, scanned, ocr, index, index_source, page_map, extras: Default::default() };
+    let (index, index_source, skip) = build_index(&lines, n, heading::body_size(&hist), &page_map);
+    let mut pinfo = cache::PreviewInfo::default();
+    if want {
+        say("S previews...");
+        // the book's own outline is a better source of section targets than our generated index
+        let mut real = outline_entries(file);
+        toc::refine_y(&mut real, &lines, n);
+        let built = pstore::build(targets, raw_refs, raw_links, if real.is_empty() { &index } else { &real }, &sizes, &skip);
+        pstore::write(&dir, &built, n).map_err(|e| e.to_string())?;
+        pinfo = cache::PreviewInfo { done: true, targets: built.targets.len() as u32, refs: built.refs.len() as u32 };
+    }
+    let a = Analysis { version: cache::VERSION, pages: n as u32, has_text, scanned, ocr, index, index_source, page_map, previews: pinfo, extras: Default::default() };
     cache::save(&dir, &a).map_err(|e| e.to_string())
 }
 
+/// The PDF's own outline, flattened.
+fn outline_entries(file: &Path) -> Vec<IndexEntry> {
+    fn walk(list: &[mupdf::Outline], level: u8, out: &mut Vec<IndexEntry>) {
+        for o in list {
+            if let Some(d) = o.dest {
+                let y = match d.kind {
+                    mupdf::DestinationKind::XYZ { top, .. } | mupdf::DestinationKind::FitH { top } | mupdf::DestinationKind::FitBH { top } => top.unwrap_or(0.0),
+                    mupdf::DestinationKind::FitR { top, .. } => top,
+                    _ => 0.0,
+                };
+                out.push(IndexEntry { title: o.title.clone(), page: d.loc.page_number, y, level });
+            }
+            walk(&o.down, level.saturating_add(1), out);
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(doc) = open_doc(&file.to_path_buf()) {
+        if let Ok(o) = doc.outlines() {
+            walk(&o, 1, &mut out);
+        }
+    }
+    out
+}
+
 /// The book's own contents when it has one that resolves, else heading heuristics.
-fn build_index(lines: &[Line], n: usize, body: f32, map: &pages::PageMap) -> (Vec<IndexEntry>, IndexSource) {
+fn build_index(lines: &[Line], n: usize, body: f32, map: &pages::PageMap) -> (Vec<IndexEntry>, IndexSource, Vec<bool>) {
     let det = toc::detect(lines, n);
+    let mut skip = heading::index_pages(lines, n);
+    for &p in &det.pages {
+        skip[p as usize] = true;
+    }
     let debug = std::env::var_os("STRATA_DEBUG").is_some();
     if debug {
         eprintln!("contents pages {:?}, {} raw entries", det.pages, det.raw.len());
@@ -312,15 +433,12 @@ fn build_index(lines: &[Line], n: usize, body: f32, map: &pages::PageMap) -> (Ve
         }
         // a ToC whose titles mostly cannot be found on their pages points at a wrong offset
         if r.entries.len() >= 5 && r.located * 5 >= r.entries.len() {
-            return (r.entries, IndexSource::Contents);
+            return (r.entries, IndexSource::Contents, skip);
         }
     }
-    let mut skip = heading::index_pages(lines, n);
-    for &p in &det.pages {
-        skip[p as usize] = true;
-    }
     let start = det.pages.first().copied();
-    (heading::build_index(lines, body, n, &skip, start), IndexSource::Heuristic)
+    let index = heading::build_index(lines, body, n, &skip, start);
+    (index, IndexSource::Heuristic, skip)
 }
 
 /// `strata --dump-lines <file> [first] [last]`: developer aid showing the heading metrics.
@@ -332,7 +450,7 @@ pub fn dump_lines(args: &[String]) -> ExitCode {
     let b: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(a).min(n.saturating_sub(1));
     eprintln!("outline entries: {} pages: {n}", doc.outlines().map_or(0, |o| o.len()));
     for p in a..=b {
-        if let Some(i) = analyze_page(&doc, p) {
+        if let Some(i) = analyze_page(&doc, p, false) {
             for l in i.short {
                 println!("{p:4} size {:5.1} b{} gap {:6.1}/{:6.1} y {:6.1} | {}", l.size, l.bold as u8, l.gap_above, l.gap_below, l.y0, l.text);
             }
@@ -417,4 +535,58 @@ mod tests {
         assert_eq!(t[0].down[0].down[0].title, "a1x");
         assert!(t[1].down.is_empty());
     }
+}
+
+/// `strata --dump-previews <file> [n] [kind]`: developer aid. Counts by kind, then `n` sampled
+/// references with the text under them and the target they resolve to.
+pub fn dump_previews(args: &[String]) -> ExitCode {
+    let Some(f) = args.first().map(PathBuf::from) else { return ExitCode::from(2) };
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let only = args.get(2).cloned();
+    let Ok(dir) = cache::dir_for(&f) else { return ExitCode::FAILURE };
+    let Some(store) = pstore::Store::open(&dir) else {
+        eprintln!("no previews in the cache (run strata --analyze first)");
+        return ExitCode::FAILURE;
+    };
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for t in &store.targets {
+        *counts.entry(t.kind.name().to_string()).or_default() += 1;
+    }
+    eprintln!("targets {} refs {} : {counts:?}", store.targets.len(), store.ref_count());
+    let ocr = cache::ocr_path(&dir);
+    let doc = open_doc(&if ocr.exists() { ocr } else { f.clone() }).ok();
+    let pages = doc.as_ref().and_then(|d| d.page_count().ok()).unwrap_or(0) as u32;
+    let mut all: Vec<(u32, previews::Ref)> = Vec::new();
+    for p in 0..pages {
+        all.extend(store.refs_on(p).into_iter().map(|r| (p, r)));
+    }
+    let mut rc: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, r) in &all {
+        *rc.entry(store.targets[r.target as usize].kind.name().to_string()).or_default() += 1;
+    }
+    eprintln!("refs by target kind: {rc:?}");
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let mut picked = 0;
+    while picked < n && !all.is_empty() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let (p, r) = all[(state % all.len() as u64) as usize];
+        let t = &store.targets[r.target as usize];
+        if only.as_ref().is_some_and(|k| k != t.kind.name()) {
+            if rc.get(only.as_ref().unwrap()).is_none() {
+                break;
+            }
+            continue;
+        }
+        picked += 1;
+        let txt = doc.as_ref().map(|d| text_in(d, p, r.rect)).unwrap_or_default();
+        let ttxt = doc.as_ref().map(|d| text_in(d, t.page, t.rect)).unwrap_or_default();
+        println!("p{:<4} {:<22} -> {} p{} y{:.0}-{:.0}\n       target: {}", p + 1, format!("'{txt}'"), t.title(), t.page + 1, t.rect[1], t.rect[3], &ttxt.chars().take(110).collect::<String>());
+    }
+    ExitCode::SUCCESS
+}
+
+fn text_in(doc: &Document, p: u32, r: [f32; 4]) -> String {
+    crate::render::text_in_rect(doc, p, r).split_whitespace().collect::<Vec<_>>().join(" ")
 }

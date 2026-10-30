@@ -7,6 +7,8 @@ mod keys;
 mod layout;
 mod links;
 mod pages;
+mod previews;
+mod pstore;
 mod recolor;
 mod render;
 mod search;
@@ -26,6 +28,7 @@ fn main() -> ExitCode {
         Some("--analyze") => return analyze::run(&argv[1..]),
         Some("--dump-lines") => return analyze::dump_lines(&argv[1..]),
         Some("--write-index") => return analyze::write_index(&argv[1..]),
+        Some("--dump-previews") => return analyze::dump_previews(&argv[1..]),
         _ => {}
     }
     let Some(arg) = std::env::args_os().nth(1) else {

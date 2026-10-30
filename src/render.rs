@@ -143,7 +143,20 @@ pub struct SearchReq {
     pub case_sensitive: bool,
 }
 
+/// A clipped render of part of a page (preview popup).
+pub struct PreviewReq {
+    pub id: u64,
+    pub page: u32,
+    /// Page points from the page origin.
+    pub rect: [f32; 4],
+    pub scale: f32,
+    pub recolor: Recolor,
+}
+
 pub enum Cmd {
+    Preview(PreviewReq),
+    /// Plain text inside a rectangle (for the clipboard).
+    Text { page: u32, rect: [f32; 4] },
     Tile(Request),
     Search(SearchReq),
     CancelSearch,
@@ -154,6 +167,8 @@ pub enum Cmd {
 }
 
 pub enum Response {
+    Preview { id: u64, tile: Tile },
+    Text(String),
     Tile { key: TileKey, gen: u64, tile: Tile },
     /// The renderer discarded the request because it was no longer wanted.
     Skipped { key: TileKey },
@@ -331,6 +346,15 @@ impl Renderer {
     fn handle(&mut self, c: Cmd) {
         match c {
             Cmd::Tile(r) => self.queue.push(r),
+            Cmd::Preview(req) => {
+                let tile = self.render_preview(&req).unwrap_or(Tile { w: 0, h: 0, data: Vec::new() });
+                self.shrink_store();
+                self.send(Response::Preview { id: req.id, tile });
+            }
+            Cmd::Text { page, rect } => {
+                let t = text_in_rect(&self.doc, page, rect);
+                self.send(Response::Text(t));
+            }
             Cmd::Search(req) => {
                 let n = self.sizes.len();
                 let start = (req.start_page as usize).min(n - 1);
@@ -379,6 +403,28 @@ impl Renderer {
             Some(LinkInfo { rect: [l.bounds.x0 - b.x0, l.bounds.y0 - b.y0, l.bounds.x1 - b.x0, l.bounds.y1 - b.y0], target })
         })
         .collect()
+    }
+
+    fn render_preview(&mut self, req: &PreviewReq) -> Option<Tile> {
+        let page = self.doc.load_page(req.page as i32).ok()?;
+        let b = page.bounds().ok()?;
+        let s = req.scale;
+        let (w, h) = (((req.rect[2] - req.rect[0]) * s).ceil().max(1.0) as i32, ((req.rect[3] - req.rect[1]) * s).ceil().max(1.0) as i32);
+        let mut pix = Pixmap::new_with_rect(&self.cs, IRect::new(0, 0, w, h), true).ok()?;
+        pix.clear().ok()?;
+        let mut ctm = Matrix::new_translate(-(b.x0 + req.rect[0]), -(b.y0 + req.rect[1]));
+        ctm.concat(Matrix::new_scale(s, s));
+        {
+            let dev = Device::from_pixmap(&pix).ok()?;
+            page.run(&dev, &ctm).ok()?;
+        }
+        let (pw, ph, stride) = (pix.width() as usize, pix.height() as usize, pix.stride() as usize);
+        let src = pix.samples();
+        let mut data = Vec::with_capacity(pw * ph);
+        for row in 0..ph {
+            data.extend(src[row * stride..row * stride + pw * 4].chunks_exact(4).map(|p| req.recolor.pixel(p[0], p[1], p[2], p[3])));
+        }
+        Some(Tile { w: pw as u32, h: ph as u32, data })
     }
 
     fn send_outline(&mut self) {
@@ -474,6 +520,31 @@ impl Renderer {
             self.send(Response::SearchDone { id });
         }
     }
+}
+
+/// Text of the characters whose centres lie inside `r` (page points from the page origin).
+pub fn text_in_rect(doc: &Document, p: u32, r: [f32; 4]) -> String {
+    let Ok(page) = doc.load_page(p as i32) else { return String::new() };
+    let Ok(b) = page.bounds() else { return String::new() };
+    let Ok(tp) = page.to_text_page(mupdf::TextPageFlags::empty()) else { return String::new() };
+    let mut s = String::new();
+    for block in &tp.structured().blocks {
+        let mupdf::TextBlockContent::Text { lines } = &block.content else { continue };
+        for l in lines {
+            let mut any = false;
+            for c in &l.chars {
+                let (cx, cy) = ((c.quad.ul.x + c.quad.lr.x) / 2.0 - b.x0, (c.quad.ul.y + c.quad.lr.y) / 2.0 - b.y0);
+                if cx >= r[0] - 1.0 && cx <= r[2] + 1.0 && cy >= r[1] - 1.0 && cy <= r[3] + 1.0 {
+                    s.push(c.ch);
+                    any = true;
+                }
+            }
+            if any {
+                s.push('\n');
+            }
+        }
+    }
+    s
 }
 
 fn page_hits(doc: &Document, p: usize, query: &str, cs: bool) -> Vec<Rect4> {

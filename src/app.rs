@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Window, WindowId};
@@ -22,15 +23,24 @@ use crate::keys::{self, Command, KeyState, Keymap, Mode};
 use crate::layout::{page_px, tile_grid, Layout};
 use crate::links::{hint_labels, open_external, Jumplist, LinkInfo, Target, HINT_ALPHABET};
 use crate::recolor::Recolor;
-use crate::render::{Cmd, RenderHandle, Request, Response, SearchReq, Tile, TileCache, TileKey};
+use crate::previews::{Kind, Ref};
+use crate::pstore::Store;
+use crate::render::{Cmd, PreviewReq, RenderHandle, Request, Response, SearchReq, Tile, TileCache, TileKey};
 use crate::search::{case_sensitive, Hit, Search};
 use crate::text::TextRenderer;
 use crate::ui::help::Help;
+use crate::ui::plist::{self, PList};
+use crate::ui::popup::{self, Popup};
 use crate::ui::index::{self, Index, Item};
 use crate::worker::{Job, Msg};
 use crate::ui::input::{History, InputBar};
 use crate::ui::statusbar::{self, Status};
 use crate::ui::{over, pm, Canvas, FG};
+
+fn debug() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("STRATA_DEBUG").is_some())
+}
 
 const WHEEL_PX: f32 = 50.0; // logical px per wheel notch
 const MIN_ZOOM: f32 = 0.1;
@@ -43,6 +53,7 @@ enum Overlay {
     Input(InputBar),
     Help(Help),
     Hints(Hints),
+    List(PList),
 }
 
 struct HintItem {
@@ -50,6 +61,8 @@ struct HintItem {
     rect: [f32; 4],
     label: String,
     target: Target,
+    /// Preview hints open this target's popup instead of following `target`.
+    pv: Option<u32>,
 }
 
 struct Hints {
@@ -121,6 +134,13 @@ pub struct App {
     auto_items: Vec<Item>,
     index_auto: Option<&'static str>,
     analysis: Option<Analysis>,
+    pv: Option<Store>,
+    pv_refs: HashMap<u32, Vec<Ref>>,
+    popup: Option<Popup>,
+    popup_seq: u64,
+    /// The reference under the mouse (page, index on page) and when its popup should open.
+    hover: popup::HoverTimer,
+    yank_pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +201,12 @@ impl App {
             outline_items: Vec::new(),
             auto_items: Vec::new(),
             index_auto: None,
+            pv: None,
+            pv_refs: HashMap::new(),
+            popup: None,
+            popup_seq: 0,
+            hover: popup::HoverTimer::default(),
+            yank_pending: false,
             analysis: None,
         };
         app.load_config();
@@ -289,13 +315,17 @@ impl App {
     }
 
     /// Use the cached analysis if valid, otherwise run the niced child. `force_ocr` / `recompute` skip the cache.
-    fn start_analysis(&mut self, force_ocr: bool, recompute: bool) {
+    fn start_analysis(&mut self, force_ocr: bool, mut recompute: bool) {
         self.cancel_job();
         let Ok(dir) = cache::dir_for(&self.path) else { return };
         if !force_ocr && !recompute {
             if let Some(a) = cache::load(&dir) {
+                let need_previews = self.cfg.previews && !a.previews.done && self.cfg.auto_analyze;
                 self.apply_analysis(a, &dir);
-                return;
+                if !need_previews {
+                    return;
+                }
+                recompute = true; // cached before previews were wanted: one more pass
             }
         }
         if !self.cfg.auto_analyze && !force_ocr && !recompute {
@@ -311,6 +341,9 @@ impl App {
         }
         if recompute {
             args.push("--force");
+        }
+        if !self.cfg.previews {
+            args.push("--no-previews");
         }
         self.spawn_job(&args, JobKind::Analyze);
     }
@@ -349,6 +382,10 @@ impl App {
         if let OcrState::Failed(e) = &a.ocr {
             self.err(format!("OCR: {e}"));
         }
+        self.pv = if self.cfg.previews && a.previews.done { Store::open(dir) } else { None };
+        self.pv_refs.clear();
+        self.popup = None;
+        self.hover.cancel();
         self.analysis = Some(a);
         self.refresh_index();
     }
@@ -574,6 +611,32 @@ impl App {
                 }
             }
             Command::Help => self.overlay = Overlay::Help(Help::new(&self.keymap)),
+            Command::Previews => match &self.pv {
+                Some(pv) => self.overlay = Overlay::List(PList::new(&pv.targets)),
+                None => self.err("No previews (analysis pending, or `previews` is off)".into()),
+            },
+            Command::PreviewHints => self.start_preview_hints(),
+            Command::PopupClose => self.close_popup(),
+            Command::PopupJump => self.popup_jump(),
+            Command::PopupDown | Command::PopupUp => {
+                let d = (self.cfg.scroll_step * self.dpi * n as f32) as i32;
+                if let Some(p) = self.popup.as_mut() {
+                    p.scroll_by(if cmd == Command::PopupDown { d } else { -d });
+                }
+            }
+            Command::PopupZoomIn | Command::PopupZoomOut => {
+                if let Some(p) = self.popup.as_mut() {
+                    p.zoom = (if cmd == Command::PopupZoomIn { p.zoom * 1.25 } else { p.zoom / 1.25 }).clamp(0.4, 4.0);
+                    self.request_popup();
+                }
+            }
+            Command::PopupYank => {
+                if let (Some(p), Some(pv)) = (&self.popup, &self.pv) {
+                    let t = &pv.targets[p.target as usize];
+                    self.yank_pending = true;
+                    let _ = self.render.req_tx.send(Cmd::Text { page: t.page, rect: t.rect });
+                }
+            }
             Command::Index => self.mode = if self.mode == Mode::Index { Mode::Normal } else { Mode::Index },
             Command::IndexDown => self.index.down(n as usize),
             Command::IndexUp => self.index.up(n as usize),
@@ -751,7 +814,7 @@ impl App {
         let items = links
             .into_iter()
             .zip(labels)
-            .map(|((page, rect, target), label)| HintItem { page, rect, label, target })
+            .map(|((page, rect, target), label)| HintItem { page, rect, label, target, pv: None })
             .collect();
         self.overlay = Overlay::Hints(Hints { typed: String::new(), items });
     }
@@ -774,11 +837,207 @@ impl App {
         }
     }
 
+    // ---- previews -----------------------------------------------------------------------
+
+    fn refs_for(&mut self, page: u32) -> &Vec<Ref> {
+        if self.pv_refs.len() > 40 {
+            self.pv_refs.clear();
+        }
+        let pv = &self.pv;
+        self.pv_refs.entry(page).or_insert_with(|| pv.as_ref().map(|s| s.refs_on(page)).unwrap_or_default())
+    }
+
+    /// The reference under the mouse: (page, index on that page).
+    fn ref_at(&mut self) -> Option<(u32, usize, Ref)> {
+        self.pv.as_ref()?;
+        let s = self.scale();
+        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        if my >= self.doc_h() as f32 || mx < 0.0 || my < 0.0 {
+            return None;
+        }
+        let (xp, yp) = (self.x0() + mx / s, self.sy + my / s);
+        let p = self.layout.page_at(yp);
+        let (lx, ly) = (xp - self.layout.left(p), yp - self.layout.top(p));
+        let page = p as u32;
+        self.refs_for(page).iter().enumerate().find(|(_, r)| lx >= r.rect[0] - 1.0 && lx <= r.rect[2] + 1.0 && ly >= r.rect[1] - 1.0 && ly <= r.rect[3] + 1.0).map(|(i, r)| (page, i, *r))
+    }
+
+    /// Mouse moved: arm or cancel the hover timer, close a hover popup the mouse left.
+    fn update_hover(&mut self) {
+        let active = self.cfg.previews && self.pv.is_some() && matches!(self.overlay, Overlay::None) && self.mode == Mode::Normal;
+        if !active {
+            return;
+        }
+        if self.popup.as_ref().is_some_and(|p| p.hover && p.contains(self.cursor.0, self.cursor.1)) {
+            self.hover.disarm();
+            return; // moved onto the popup itself
+        }
+        let key = self.ref_at().map(|(p, i, _)| (p, i));
+        if self.hover.moved(key, Instant::now(), Duration::from_millis(self.cfg.preview_hover_ms)) && self.popup.as_ref().is_some_and(|p| p.hover) {
+            self.popup = None;
+            self.redraw();
+        }
+    }
+
+    /// Open the popup for the reference the mouse rests on.
+    fn hover_fire(&mut self) {
+        let Some((page, i)) = self.hover.key else { return };
+        let Some(target) = self.refs_for(page).get(i).map(|r| r.target) else { return };
+        self.open_popup(target, (self.cursor.0 as i32, self.cursor.1 as i32), true);
+        self.redraw();
+    }
+
+    fn open_popup(&mut self, target: u32, anchor: (i32, i32), hover: bool) {
+        let Some(pv) = &self.pv else { return };
+        let Some(t) = pv.targets.get(target as usize) else { return };
+        let title = if t.kind == Kind::Link { format!("Destination — p.{}", t.page + 1) } else { format!("{} — p.{}", t.title(), t.page + 1) };
+        if debug() {
+            eprintln!("open popup target {target} hover={hover}");
+        }
+        self.popup = Some(Popup { target, id: 0, tile: None, zoom: 1.0, scroll: 0, hover, anchor, title, rect: (0, 0, 0, 0) });
+        if !hover {
+            self.mode = Mode::Popup;
+        }
+        self.request_popup();
+    }
+
+    fn request_popup(&mut self) {
+        let (Some(p), Some(pv)) = (self.popup.as_mut(), self.pv.as_ref()) else { return };
+        let t = &pv.targets[p.target as usize];
+        let (rw, rh) = ((t.rect[2] - t.rect[0]).max(4.0), (t.rect[3] - t.rect[1]).max(4.0));
+        let base = (0.6 * self.vp.0 as f32 / rw).min(self.cfg.preview_max_scale * self.dpi);
+        // crisp, but never more than ~6 Mpx however large the region
+        let s = (base * p.zoom).min((6.0e6 / (rw * rh)).sqrt()).max(0.2);
+        self.popup_seq += 1;
+        p.id = self.popup_seq;
+        let recolor = self.applied.recolor.with_enabled(self.cfg.recolor.enabled);
+        let _ = self.render.req_tx.send(Cmd::Preview(PreviewReq { id: p.id, page: t.page, rect: t.rect, scale: s, recolor }));
+    }
+
+    fn close_popup(&mut self) {
+        self.popup = None;
+        if self.mode == Mode::Popup {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    fn popup_jump(&mut self) {
+        let Some(t) = self.popup.as_ref().and_then(|p| self.pv.as_ref().map(|pv| pv.targets[p.target as usize].clone())) else { return };
+        self.close_popup();
+        if matches!(self.overlay, Overlay::List(_)) {
+            self.overlay = Overlay::None;
+        }
+        self.jumps.push(self.sy);
+        self.goto_page_y(t.page as usize, Some(t.rect[1]));
+    }
+
+    fn start_preview_hints(&mut self) {
+        if !self.cfg.previews || self.pv.is_none() {
+            self.err("No previews (analysis pending, or `previews` is off)".into());
+            return;
+        }
+        let (_, vh) = self.vp_pt();
+        let s = self.scale();
+        let doc_h = self.doc_h() as f32;
+        let mut found: Vec<(u32, [f32; 4], u32)> = Vec::new();
+        for p in self.layout.visible(self.sy, self.sy + vh) {
+            let (_, py) = self.page_origin(p);
+            for r in self.refs_for(p as u32).clone() {
+                let (y0, y1) = (py as f32 + r.rect[1] * s, py as f32 + r.rect[3] * s);
+                if y1 > 0.0 && y0 < doc_h {
+                    found.push((p as u32, r.rect, r.target));
+                }
+            }
+        }
+        if found.is_empty() {
+            self.err("No previewable references on screen".into());
+            return;
+        }
+        let labels = hint_labels(found.len(), HINT_ALPHABET);
+        let items = found
+            .into_iter()
+            .zip(labels)
+            .map(|((page, rect, t), label)| HintItem { page, rect, label, target: Target::Page(0, None), pv: Some(t) })
+            .collect();
+        self.overlay = Overlay::Hints(Hints { typed: String::new(), items });
+    }
+
+    /// Hand text to the clipboard through `wl-copy`; the helper is reaped on its own thread.
+    fn to_clipboard(&mut self, text: String) {
+        use std::io::Write;
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        match std::process::Command::new("wl-copy").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Some(mut si) = child.stdin.take() {
+                    let _ = si.write_all(text.as_bytes());
+                }
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                self.msg("Copied to clipboard".into());
+            }
+            Err(e) => self.err(format!("wl-copy: {e}")),
+        }
+    }
+
     // ---- keys ---------------------------------------------------------------------------
 
     fn on_key(&mut self, token: String, ch: Option<char>, el: &ActiveEventLoop) {
         self.message = None;
+        // a popup opened from the list takes the keys first
+        if self.popup.as_ref().is_some_and(|p| !p.hover) && matches!(self.overlay, Overlay::List(_)) {
+            if let Some((cmd, count)) = self.keys.feed(&self.keymap, Mode::Popup, &token) {
+                self.exec(cmd, count, el);
+            }
+            self.redraw();
+            return;
+        }
         match &mut self.overlay {
+            Overlay::List(l) => {
+                let Some(pv) = &self.pv else {
+                    self.overlay = Overlay::None;
+                    return;
+                };
+                let tg = &pv.targets;
+                match token.as_str() {
+                    "<Esc>" => {
+                        if l.query.is_empty() {
+                            self.overlay = Overlay::None;
+                        } else {
+                            l.query.clear();
+                            l.sel = 0;
+                        }
+                    }
+                    "<BS>" => l.backspace(),
+                    "<Down>" | "<C-n>" => l.move_sel(1, tg),
+                    "<Up>" | "<C-p>" => l.move_sel(-1, tg),
+                    "<PgDn>" | "<C-d>" => l.move_sel(10, tg),
+                    "<PgUp>" | "<C-u>" => l.move_sel(-10, tg),
+                    "<CR>" => {
+                        if let Some(id) = l.current(tg) {
+                            let t = tg[id as usize].clone();
+                            self.overlay = Overlay::None;
+                            self.jumps.push(self.sy);
+                            self.goto_page_y(t.page as usize, Some(t.rect[1]));
+                        }
+                    }
+                    "<Tab>" => {
+                        if let Some(id) = l.current(tg) {
+                            self.open_popup(id, (0, 0), false);
+                        }
+                    }
+                    "<Space>" if l.query.is_empty() => {
+                        if let Some(id) = l.current(tg) {
+                            self.open_popup(id, (0, 0), false);
+                        }
+                    }
+                    _ => {
+                        if let Some(c) = ch.filter(|c| !c.is_control()) {
+                            l.type_char(c);
+                        }
+                    }
+                }
+            }
             Overlay::None => {
                 if let Some((cmd, count)) = self.keys.feed(&self.keymap, self.mode, &token) {
                     self.exec(cmd, count, el);
@@ -817,8 +1076,12 @@ impl App {
                     let typed = h.typed.clone();
                     if let Some(i) = h.items.iter().position(|i| i.label == typed) {
                         let t = h.items[i].target.clone();
+                        let pv = h.items[i].pv;
                         self.overlay = Overlay::None;
-                        self.follow(&t);
+                        match pv {
+                            Some(id) => self.open_popup(id, (0, 0), false),
+                            None => self.follow(&t),
+                        }
                     } else if !h.items.iter().any(|i| i.label.starts_with(&typed)) {
                         self.overlay = Overlay::None;
                     }
@@ -1052,6 +1315,8 @@ impl App {
         let mode_name = match (&self.overlay, self.mode) {
             (Overlay::Help(_), _) => "HELP",
             (Overlay::Hints(_), _) => "HINTS",
+            (Overlay::List(_), _) => "PREVIEWS",
+            (_, Mode::Popup) => "PREVIEW",
             (_, Mode::Index) => "INDEX",
             _ => "NORMAL",
         };
@@ -1092,8 +1357,13 @@ impl App {
             }
             if let Overlay::Help(hp) = &self.overlay {
                 help_rows = Some(crate::ui::help::draw(&mut cv, t, hp, bar));
+            } else if let (Overlay::List(l), Some(pv)) = (&mut self.overlay, &self.pv) {
+                plist::draw(&mut cv, t, l, &pv.targets, bar);
             } else if self.mode == Mode::Index {
                 index_rows = Some(index::draw(&mut cv, t, &mut self.index, index_auto, bar));
+            }
+            if let Some(p) = self.popup.as_mut() {
+                popup::draw(&mut cv, t, p);
             }
             if bar_visible {
                 let st = Status {
@@ -1244,6 +1514,18 @@ impl ApplicationHandler<()> for App {
         self.start_analysis(false, false);
     }
 
+    /// The only timer in the program: armed while a hover is pending, otherwise `Wait`.
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        match self.hover.poll(Instant::now()) {
+            popup::Poll::Fire => {
+                self.hover_fire();
+                el.set_control_flow(ControlFlow::Wait);
+            }
+            popup::Poll::Wait(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
+            popup::Poll::Idle => el.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
     fn user_event(&mut self, _el: &ActiveEventLoop, _: ()) {
         let cur = self.render.gen.load(Ordering::Relaxed);
         let mut changed = false;
@@ -1290,6 +1572,19 @@ impl ApplicationHandler<()> for App {
                     self.links_pending.remove(&page);
                     self.links.insert(page, links);
                 }
+                Response::Preview { id, tile } => {
+                    if let Some(p) = self.popup.as_mut().filter(|p| p.id == id) {
+                        if debug() {
+                            eprintln!("popup {} rendered {}x{} px, hover={}", p.title, tile.w, tile.h, p.hover);
+                        }
+                        p.tile = Some(tile);
+                    }
+                }
+                Response::Text(t) => {
+                    if std::mem::take(&mut self.yank_pending) {
+                        self.to_clipboard(t);
+                    }
+                }
                 Response::Outline(items) => {
                     self.outline_items = items;
                     self.refresh_index();
@@ -1326,7 +1621,17 @@ impl ApplicationHandler<()> for App {
                 self.apply_config();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+                self.update_hover();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.hover.cancel();
+                if self.popup.as_ref().is_some_and(|p| p.hover) {
+                    self.popup = None;
+                    self.redraw();
+                }
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if matches!(self.overlay, Overlay::None) && self.mode == Mode::Normal {
                     self.click();
@@ -1342,7 +1647,18 @@ impl ApplicationHandler<()> for App {
                     MouseScrollDelta::LineDelta(x, y) => (x, y),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32 / (WHEEL_PX * self.dpi), p.y as f32 / (WHEEL_PX * self.dpi)),
                 };
+                let over_popup = self.popup.as_ref().is_some_and(|p| p.contains(self.cursor.0, self.cursor.1));
                 match &mut self.overlay {
+                    _ if over_popup => {
+                        if let Some(p) = self.popup.as_mut() {
+                            p.scroll_by((-dy * WHEEL_PX * self.dpi) as i32);
+                        }
+                    }
+                    Overlay::List(l) => {
+                        if let Some(pv) = &self.pv {
+                            l.move_sel(-(dy * 3.0) as i32, &pv.targets);
+                        }
+                    }
                     Overlay::Help(h) => h.scroll_by(-(dy * 3.0) as i32, self.help_rows),
                     _ if self.mode == Mode::Index => {
                         if dy > 0.0 { self.index.up((dy * 3.0) as usize) } else { self.index.down((-dy * 3.0) as usize) }

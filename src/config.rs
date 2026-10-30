@@ -20,6 +20,9 @@ pub struct Config {
     pub auto_ocr: bool,
     pub auto_index: AutoIndex,
     pub auto_analyze: bool,
+    pub previews: bool,
+    pub preview_hover_ms: u64,
+    pub preview_max_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +51,9 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("auto-ocr", "OCR scanned documents in the background (true/false)"),
     ("auto-index", "Generated index: auto (only without outline), always, off"),
     ("auto-analyze", "Analyse documents in a background process (true/false)"),
+    ("previews", "Hover/keyboard previews of equations, theorems, figures (true/false)"),
+    ("preview-hover-ms", "Hover time before a preview popup opens, in ms"),
+    ("preview-max-scale", "Maximum render scale of the popup (1 = 100%)"),
 ];
 
 impl Default for Config {
@@ -67,6 +73,9 @@ impl Default for Config {
             auto_ocr: true,
             auto_index: AutoIndex::Auto,
             auto_analyze: true,
+            previews: true,
+            preview_hover_ms: 300,
+            preview_max_scale: 3.0,
         }
     }
 }
@@ -147,6 +156,9 @@ impl Config {
             "incremental-search" => self.incremental_search = parse_bool(v)?,
             "auto-ocr" => self.auto_ocr = parse_bool(v)?,
             "auto-analyze" => self.auto_analyze = parse_bool(v)?,
+            "previews" => self.previews = parse_bool(v)?,
+            "preview-hover-ms" => self.preview_hover_ms = parse_num(v, 0.0, 5000.0)? as u64,
+            "preview-max-scale" => self.preview_max_scale = parse_num(v, 0.5, 8.0)?,
             "auto-index" => {
                 self.auto_index = match v {
                     "auto" => AutoIndex::Auto,
@@ -178,6 +190,9 @@ impl Config {
             "incremental-search" => self.incremental_search.to_string(),
             "auto-ocr" => self.auto_ocr.to_string(),
             "auto-analyze" => self.auto_analyze.to_string(),
+            "previews" => self.previews.to_string(),
+            "preview-hover-ms" => self.preview_hover_ms.to_string(),
+            "preview-max-scale" => self.preview_max_scale.to_string(),
             "auto-index" => format!("{:?}", self.auto_index).to_lowercase(),
             _ => return None,
         })

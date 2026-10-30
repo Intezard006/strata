@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Bump to invalidate every cached result.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 const SAMPLE: u64 = 64 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -64,6 +64,14 @@ pub enum IndexSource {
     Contents,
 }
 
+/// Whether `previews.json` / `refs.bin` were produced, and how much they hold.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PreviewInfo {
+    pub done: bool,
+    pub targets: u32,
+    pub refs: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Analysis {
     pub version: u32,
@@ -77,6 +85,8 @@ pub struct Analysis {
     /// Printed page numbers <-> PDF pages (for a printed-page `:goto`).
     #[serde(default)]
     pub page_map: crate::pages::PageMap,
+    #[serde(default)]
+    pub previews: PreviewInfo,
     #[serde(default)]
     pub extras: Extras,
 }
@@ -295,7 +305,7 @@ mod tests {
 
     #[test]
     fn extras_default_when_absent() {
-        let j = r#"{"version":2,"pages":1,"has_text":[true],"scanned":false,"ocr":"NotNeeded","index":[]}"#;
+        let j = r#"{"version":3,"pages":1,"has_text":[true],"scanned":false,"ocr":"NotNeeded","index":[]}"#;
         let a: Analysis = serde_json::from_str(j).unwrap();
         assert!(a.extras.targets.is_empty());
     }

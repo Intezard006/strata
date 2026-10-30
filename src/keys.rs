@@ -4,15 +4,17 @@
 pub enum Mode {
     Normal,
     Index,
+    Popup,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 2] = [Mode::Normal, Mode::Index];
+    pub const ALL: [Mode; 3] = [Mode::Normal, Mode::Index, Mode::Popup];
 
     pub fn name(self) -> &'static str {
         match self {
             Mode::Normal => "normal",
             Mode::Index => "index",
+            Mode::Popup => "popup",
         }
     }
 
@@ -67,6 +69,16 @@ pub enum Command {
     IndexClose,
     IndexFirst,
     IndexLast,
+    /// List of all previewable targets.
+    Previews,
+    PreviewHints,
+    PopupClose,
+    PopupJump,
+    PopupDown,
+    PopupUp,
+    PopupZoomIn,
+    PopupZoomOut,
+    PopupYank,
     Set(String, Option<String>),
     Map(Mode, String, String),
     Unmap(Mode, String),
@@ -122,6 +134,15 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("index-close", "", "Index: close panel"),
     ("index-first", "", "Index: first entry"),
     ("index-last", "", "Index: last entry"),
+    ("previews", "", "List all equations, theorems, figures... and preview or jump to one"),
+    ("preview-hints", "", "Show hint labels over references; type one to preview its target"),
+    ("popup-close", "", "Preview: close the popup"),
+    ("popup-jump", "", "Preview: jump to the target (Ctrl-o returns)"),
+    ("popup-down", "", "Preview: scroll down"),
+    ("popup-up", "", "Preview: scroll up"),
+    ("popup-zoom-in", "", "Preview: zoom in"),
+    ("popup-zoom-out", "", "Preview: zoom out"),
+    ("popup-yank", "", "Preview: copy the target's text to the clipboard (wl-copy)"),
     ("set", "OPTION [VALUE]", "Show or change an option"),
     ("map", "[MODE] KEYS COMMAND", "Bind KEYS to COMMAND"),
     ("unmap", "[MODE] KEYS", "Remove a binding"),
@@ -195,6 +216,15 @@ pub fn parse_words(name: &str, args: &[String]) -> Result<Command, String> {
         "index-close" => IndexClose,
         "index-first" => IndexFirst,
         "index-last" => IndexLast,
+        "previews" => Previews,
+        "preview-hints" => PreviewHints,
+        "popup-close" => PopupClose,
+        "popup-jump" => PopupJump,
+        "popup-down" => PopupDown,
+        "popup-up" => PopupUp,
+        "popup-zoom-in" => PopupZoomIn,
+        "popup-zoom-out" => PopupZoomOut,
+        "popup-yank" => PopupYank,
         "set" => Set(one()?, args.get(1).cloned()),
         "map" | "unmap" => {
             let (mode, a) = match args.first().and_then(|m| Mode::from_name(m)) {
@@ -271,6 +301,20 @@ const DEFAULTS: &[(Mode, &str, &str)] = &[
     (Mode::Normal, "<F1>", "help"),
     (Mode::Normal, "<Tab>", "index"),
     (Mode::Normal, "q", "quit"),
+    (Mode::Normal, "p", "preview-hints"),
+    (Mode::Normal, "gp", "previews"),
+    (Mode::Popup, "<CR>", "popup-jump"),
+    (Mode::Popup, "o", "popup-jump"),
+    (Mode::Popup, "j", "popup-down"),
+    (Mode::Popup, "k", "popup-up"),
+    (Mode::Popup, "<Down>", "popup-down"),
+    (Mode::Popup, "<Up>", "popup-up"),
+    (Mode::Popup, "+", "popup-zoom-in"),
+    (Mode::Popup, "=", "popup-zoom-in"),
+    (Mode::Popup, "-", "popup-zoom-out"),
+    (Mode::Popup, "y", "popup-yank"),
+    (Mode::Popup, "q", "popup-close"),
+    (Mode::Popup, "<Esc>", "popup-close"),
     (Mode::Index, "j", "index-down"),
     (Mode::Index, "k", "index-up"),
     (Mode::Index, "<Down>", "index-down"),

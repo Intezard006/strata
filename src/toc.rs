@@ -305,7 +305,13 @@ fn words_of(s: &str) -> Vec<String> {
 
 /// Title without its Chapter/Part/§/number marker.
 fn core_words(title: &str) -> Vec<String> {
-    let mut t = title.trim();
+    words_of(core_text(title).1)
+}
+
+/// (marker prefix, rest): `("Chapter 1 ", "Set Theory")`.
+fn core_text(title: &str) -> (&str, &str) {
+    let title = title.trim();
+    let mut t = title;
     if let Some(r) = numbering(t) {
         t = r.1;
     } else if let Some((k, rest)) = t.split_once(' ') {
@@ -316,7 +322,11 @@ fn core_words(title: &str) -> Vec<String> {
     if t.starts_with('§') {
         t = t.split_once(' ').map_or("", |x| x.1);
     }
-    words_of(t)
+    (&title[..title.len() - t.len()], t)
+}
+
+fn letters(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
 fn compact(words: &[String]) -> Vec<char> {
@@ -368,6 +378,24 @@ fn match_page(core: &[char], page: &[Line]) -> Option<(usize, f32)> {
     best
 }
 
+/// Fill in `y` for entries that only know their page (outline destinations without a top):
+/// find the title's own line on that page.
+pub fn refine_y(entries: &mut [IndexEntry], lines: &[Line], pages: usize) {
+    let mut raw_pages: Vec<Vec<&Line>> = vec![Vec::new(); pages];
+    for l in lines.iter().filter(|l| (l.page as usize) < pages) {
+        raw_pages[l.page as usize].push(l);
+    }
+    for e in entries.iter_mut().filter(|e| e.y < 1.0 && (e.page as usize) < pages) {
+        let pg = rows(&raw_pages[e.page as usize]);
+        let core = compact(&core_words(&e.title));
+        if let Some((li, score)) = match_page(&core, &pg) {
+            if score >= 0.8 {
+                e.y = pg[li].y0;
+            }
+        }
+    }
+}
+
 pub struct Resolved {
     pub entries: Vec<IndexEntry>,
     pub located: usize,
@@ -412,7 +440,7 @@ pub fn resolve(det: &Detected, lines: &[Line], pages: usize, map: &PageMap) -> R
         order: usize,
     }
     // y of the title on a page, including the "Chapter N" / "Part N" label above it
-    let find_on = |pg: &[Line], core: &[char], title: &str, strict: bool| -> Option<f32> {
+    let find_on = |pg: &[Line], core: &[char], title: &str, strict: bool| -> Option<(f32, Option<String>)> {
         let (li, score) = match_page(core, pg)?;
         if strict && score < 0.8 {
             return None;
@@ -424,14 +452,18 @@ pub fn resolve(det: &Detected, lines: &[Line], pages: usize, map: &PageMap) -> R
                 y = y.min(l.y0);
             }
         }
-        Some(y)
+        // the page's own line may have better word spacing than the OCR'd contents entry
+        let (prefix, mine) = core_text(title);
+        let theirs = core_text(&pg[li].text).1;
+        let better = letters(mine) == letters(theirs) && theirs.matches(' ').count() > mine.matches(' ').count();
+        Some((y, better.then(|| format!("{prefix}{theirs}"))))
     };
     let mut items: Vec<Item> = Vec::new();
     let mut located = 0;
     let mut cursor = det.pages.iter().max().map_or(0, |&p| p + 1);
     for (i, r) in det.raw.iter().enumerate() {
         let core = compact(&core_words(&r.title));
-        let mut hit: Option<(u32, f32)> = None;
+        let mut hit: Option<(u32, f32, Option<String>)> = None;
         let mut page_only = None;
         if r.printed.is_some() {
             let Some(p) = pdf[i] else { continue };
@@ -445,8 +477,8 @@ pub fn resolve(det: &Detected, lines: &[Line], pages: usize, map: &PageMap) -> R
                 }
                 let c = cand as usize;
                 let pg = row_cache[c].get_or_insert_with(|| rows(&raw_pages[c]));
-                if let Some(y) = find_on(pg, &core, &r.title, false) {
-                    hit = Some((cand as u32, y));
+                if let Some((y, t)) = find_on(pg, &core, &r.title, false) {
+                    hit = Some((cand as u32, y, t));
                     break;
                 }
             }
@@ -456,8 +488,8 @@ pub fn resolve(det: &Detected, lines: &[Line], pages: usize, map: &PageMap) -> R
             let hi = next_known[i].map_or((cursor as usize + 150).min(pages - 1), |h| h as usize).min(pages - 1);
             for c in (cursor as usize)..=hi {
                 let pg = row_cache[c].get_or_insert_with(|| rows(&raw_pages[c]));
-                if let Some(y) = find_on(pg, &core, &r.title, true) {
-                    hit = Some((c as u32, y));
+                if let Some((y, t)) = find_on(pg, &core, &r.title, true) {
+                    hit = Some((c as u32, y, t));
                     break;
                 }
             }
@@ -465,12 +497,12 @@ pub fn resolve(det: &Detected, lines: &[Line], pages: usize, map: &PageMap) -> R
                 page_only = next_known[i];
             }
         }
-        let (page, y) = match (hit, page_only) {
+        let (page, y, better) = match (hit, page_only) {
             (Some(h), _) => {
                 located += 1;
                 h
             }
-            (None, Some(p)) => (p, 0.0),
+            (None, Some(p)) => (p, 0.0, None),
             (None, None) => continue,
         };
         let key: String = words_of(&r.title).join("");
@@ -479,7 +511,7 @@ pub fn resolve(det: &Detected, lines: &[Line], pages: usize, map: &PageMap) -> R
         }
         cursor = cursor.max(page);
         let rank = rank_kind(&r.title).map(|(rk, numeric)| if numeric && has_chapters { rk + 1 } else { rk });
-        items.push(Item { title: r.title.clone(), page, y, rank, x0: r.x0, order: i });
+        items.push(Item { title: better.unwrap_or_else(|| r.title.clone()), page, y, rank, x0: r.x0, order: i });
     }
     items.sort_by(|a, b| a.page.cmp(&b.page).then(a.rank.unwrap_or(1).cmp(&b.rank.unwrap_or(1)).then(a.order.cmp(&b.order))));
 

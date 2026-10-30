@@ -9,6 +9,9 @@ set recolor-keephue      false
 
 set cache-mb             64
 set cache-max-mb         2048     # on-disk analysis/OCR cache cap (LRU)
+set previews             true     # hover and keyboard previews of equations, theorems, figures
+set preview-hover-ms     300
+set preview-max-scale    3
 set scroll-step          40
 set zoom-step            10
 set page-gap             8
