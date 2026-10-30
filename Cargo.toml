@@ -1,0 +1,21 @@
+[package]
+name = "strata"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mupdf = { version = "0.8.0", default-features = false, features = ["epub","cbz","xps","img","html","base14-fonts"] }
+mupdf-sys = { version = "0.8.0", default-features = false }
+winit = { version = "0.30", default-features = false, features = ["rwh_06","wayland","wayland-dlopen"] }
+softbuffer = { version = "0.4", default-features = false, features = ["wayland","wayland-dlopen"] }
+
+# softbuffer 0.4.8 hardcodes Xrgb8888 on Wayland; vendored copy uses Argb8888 so alpha reaches the compositor.
+[patch.crates-io]
+softbuffer = { path = "vendor/softbuffer" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
