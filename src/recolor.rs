@@ -75,6 +75,12 @@ mod tests {
     }
 
     #[test]
+    fn opaque_light_gray_is_nearly_transparent() {
+        let a = Recolor::default().pixel(0xe0, 0xe0, 0xe0, 255) >> 24;
+        assert!(a <= 32, "alpha {a}");
+    }
+
+    #[test]
     fn antialiasing_is_preserved() {
         // half-covered black pixel: premultiplied (0,0,0,128) -> half-alpha white
         let p = Recolor::default().pixel(0, 0, 0, 128);
