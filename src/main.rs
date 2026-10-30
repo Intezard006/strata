@@ -2,6 +2,8 @@ mod analyze;
 mod app;
 mod cache;
 mod config;
+mod db;
+mod ext;
 mod heading;
 mod keys;
 mod layout;
@@ -12,6 +14,7 @@ mod pstore;
 mod recolor;
 mod render;
 mod search;
+mod synctex;
 mod text;
 mod toc;
 mod ui;
@@ -29,14 +32,38 @@ fn main() -> ExitCode {
         Some("--dump-lines") => return analyze::dump_lines(&argv[1..]),
         Some("--write-index") => return analyze::write_index(&argv[1..]),
         Some("--dump-previews") => return analyze::dump_previews(&argv[1..]),
+        Some("--exec") => return ext::run_exec(&argv[1..]),
         _ => {}
     }
-    let Some(arg) = std::env::args_os().nth(1) else {
-        eprintln!("usage: strata <file>");
+    let mut file = None;
+    let mut sync = None;
+    let mut it = std::env::args_os().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--synctex-forward" {
+            let spec = it.next().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
+            let mut p = spec.splitn(3, ':');
+            match (p.next().and_then(|v| v.parse::<u32>().ok()), p.next().and_then(|v| v.parse::<u32>().ok()), p.next()) {
+                (Some(l), Some(c), Some(f)) => sync = Some((f.to_string(), l, c)),
+                _ => {
+                    eprintln!("usage: strata --synctex-forward LINE:COL:TEXFILE PDF");
+                    return ExitCode::from(2);
+                }
+            }
+        } else if file.is_none() {
+            file = Some(a);
+        }
+    }
+    let Some(arg) = file else {
+        eprintln!("usage: strata [--synctex-forward LINE:COL:TEXFILE] <file>\n       strata --exec '<command>' [--pid N]");
         return ExitCode::from(2);
     };
     let path = PathBuf::from(arg);
     let path = std::fs::canonicalize(&path).unwrap_or(path);
+    if let Some((f, l, c)) = &sync {
+        if ext::synctex_to_running(&path, f, *l, *c) {
+            return ExitCode::SUCCESS;
+        }
+    }
     let event_loop = match EventLoop::<()>::with_user_event().build() {
         Ok(e) => e,
         Err(e) => {
@@ -52,8 +79,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut app = app::App::new(handle, sizes, path, event_loop.create_proxy());
-    if let Err(e) = event_loop.run_app(&mut app) {
+    let mut app = app::App::new(handle, sizes, path, event_loop.create_proxy(), sync);
+    let r = event_loop.run_app(&mut app);
+    app.save_state();
+    if let Err(e) = r {
         eprintln!("strata: {e}");
         return ExitCode::FAILURE;
     }

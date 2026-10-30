@@ -29,13 +29,20 @@ use crate::render::{Cmd, PreviewReq, RenderHandle, Request, Response, SearchReq,
 use crate::search::{case_sensitive, Hit, Search};
 use crate::text::TextRenderer;
 use crate::ui::help::Help;
+use crate::ui::pick::{self, Pick, PickItem, PickKind};
 use crate::ui::plist::{self, PList};
+use crate::db::{self, Db};
+use crate::ext::{self, Ext, SharedInfo};
+use crate::synctex;
 use crate::ui::popup::{self, Popup};
 use crate::ui::index::{self, Index, Item};
 use crate::worker::{Job, Msg};
 use crate::ui::input::{History, InputBar};
 use crate::ui::statusbar::{self, Status};
 use crate::ui::{over, pm, Canvas, FG};
+
+static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static FIRST_TILE: std::sync::Once = std::sync::Once::new();
 
 fn debug() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -54,6 +61,7 @@ enum Overlay {
     Help(Help),
     Hints(Hints),
     List(PList),
+    Pick(Pick),
 }
 
 struct HintItem {
@@ -141,6 +149,19 @@ pub struct App {
     /// The reference under the mouse (page, index on page) and when its popup should open.
     hover: popup::HoverTimer,
     yank_pending: bool,
+    db: Option<Db>,
+    /// Cache key of the open document (the database key).
+    key: Option<String>,
+    info: SharedInfo,
+    ext_rx: Receiver<Ext>,
+    /// After `m` (true) or `'` (false): the next key names the mark.
+    mark_prompt: Option<bool>,
+    /// A position to go to once the document in `opening` is loaded (global marks).
+    open_goto: Option<(u32, f32)>,
+    /// SyncTeX target rectangle (page, rect); stays until the next key.
+    flash: Option<(u32, [f32; 4])>,
+    /// A forward search to run once the window is up (`--synctex-forward` on a fresh start).
+    start_synctex: Option<(String, u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,9 +171,19 @@ enum JobKind {
 }
 
 impl App {
-    pub fn new(render: RenderHandle, sizes: Vec<(f32, f32)>, path: PathBuf, proxy: EventLoopProxy<()>) -> Self {
+    pub fn new(render: RenderHandle, sizes: Vec<(f32, f32)>, path: PathBuf, proxy: EventLoopProxy<()>, start_synctex: Option<(String, u32, u32)>) -> Self {
+        START.get_or_init(Instant::now);
         let cfg = Config::default();
         let (worker_tx, worker_rx) = channel();
+        let (ext_tx, ext_rx) = channel();
+        let info: SharedInfo = Default::default();
+        ext::spawn_signals(ext_tx.clone(), proxy.clone());
+        ext::spawn_dbus(ext_tx, proxy.clone(), info.clone());
+        let db = Db::open(&db::db_path()).ok();
+        let key = cache::key(&path).ok();
+        if let (Some(d), Some(k)) = (&db, &key) {
+            d.note_open(k, &path);
+        }
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut app = App {
             render,
@@ -208,8 +239,17 @@ impl App {
             hover: popup::HoverTimer::default(),
             yank_pending: false,
             analysis: None,
+            db,
+            key,
+            info,
+            ext_rx,
+            mark_prompt: None,
+            open_goto: None,
+            flash: None,
+            start_synctex,
         };
         app.load_config();
+        app.sync_info();
         app
     }
 
@@ -473,6 +513,200 @@ impl App {
         self.sx = self.sx.clamp(0.0, (self.layout.max_w - vw).max(0.0));
     }
 
+    // ---- persistence --------------------------------------------------------------------
+
+    fn sync_info(&self) {
+        if let Ok(mut i) = self.info.lock() {
+            i.filename = self.path.to_string_lossy().into_owned();
+            i.pages = self.layout.len() as u32;
+            i.page = self.current_page() as u32 + 1;
+        }
+    }
+
+    /// (page, offset below the page top) of the top of the view.
+    fn view_pos(&self) -> (u32, f32) {
+        let p = self.layout.page_at(self.sy);
+        (p as u32, self.sy - self.layout.top(p))
+    }
+
+    fn scroll_for(&self, page: u32, y: f32) -> f32 {
+        self.layout.top((page as usize).min(self.layout.len() - 1)) + y
+    }
+
+    fn goto_saved(&mut self, page: u32, y: f32) {
+        self.jumps.push(self.sy);
+        self.sy = self.scroll_for(page, y);
+        self.clamp_scroll();
+    }
+
+    /// Write the position and jumplist; called on close, focus loss, `open`, signals and exit.
+    pub fn save_state(&self) {
+        let (Some(db), Some(key)) = (&self.db, &self.key) else { return };
+        if self.opening.is_some() || self.window.is_none() {
+            return;
+        }
+        let (page, y) = self.view_pos();
+        db.save_pos(key, &self.path, &db::Pos { page, y, x: self.sx, zoom: self.zoom, recolor: Some(self.cfg.recolor.enabled) });
+        let (pos, list) = self.jumps.saved();
+        db.save_jumps(key, pos, list);
+    }
+
+    /// Restore the saved view of the current document. Returns whether a position was applied.
+    fn restore_state(&mut self) -> bool {
+        let (Some(db), Some(key)) = (&self.db, &self.key) else { return false };
+        if let Some((pos, list)) = db.load_jumps(key) {
+            self.jumps = Jumplist::from_saved(pos, list);
+        }
+        if !self.cfg.restore_position {
+            return false;
+        }
+        let Some(p) = db.load_pos(key, &self.path) else { return false };
+        if let Some(r) = p.recolor {
+            if r != self.cfg.recolor.enabled {
+                self.cfg.recolor.enabled = r;
+                self.apply_config();
+            }
+        }
+        self.zoom = p.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        self.sx = p.x;
+        self.sy = self.scroll_for(p.page, p.y);
+        self.clamp_scroll();
+        self.invalidate(false);
+        true
+    }
+
+    fn refresh_key(&mut self) {
+        self.key = cache::key(&self.path).ok();
+        if let (Some(d), Some(k)) = (&self.db, &self.key) {
+            d.note_open(k, &self.path);
+        }
+    }
+
+    fn set_mark(&mut self, c: char) {
+        let (Some(db), Some(key)) = (&self.db, self.key.clone()) else { return self.err("No state database".into()) };
+        let (page, y) = self.view_pos();
+        if c.is_ascii_uppercase() {
+            db.set_gmark(c, &key, &self.path, page, y);
+        } else {
+            db.set_mark(&key, c, page, y);
+        }
+        self.msg(format!("Mark {c} set"));
+    }
+
+    fn jump_mark(&mut self, c: char, el: &ActiveEventLoop) {
+        let Some(db) = &self.db else { return self.err("No state database".into()) };
+        if c.is_ascii_uppercase() {
+            match db.gmark(c) {
+                Some((key, _, page, y)) if self.key.as_deref() == Some(&key) => self.goto_saved(page, y),
+                Some((_, path, page, y)) => {
+                    self.open_goto = Some((page, y));
+                    self.exec(Command::Open(path.to_string_lossy().into_owned()), None, el);
+                }
+                None => self.err(format!("Mark {c} not set")),
+            }
+        } else {
+            match self.key.as_ref().and_then(|k| db.mark(k, c)) {
+                Some((page, y)) => self.goto_saved(page, y),
+                None => self.err(format!("Mark {c} not set")),
+            }
+        }
+    }
+
+    fn bookmark_here(&mut self, name: String) {
+        let (Some(db), Some(key)) = (&self.db, &self.key) else { return self.err("No state database".into()) };
+        let (page, y) = self.view_pos();
+        db.set_bookmark(key, &name, page, y);
+        self.msg(format!("Bookmark '{name}' set on page {}", page + 1));
+    }
+
+    fn open_blist(&mut self) {
+        let items: Vec<PickItem> = match (&self.db, &self.key) {
+            (Some(db), Some(key)) => db.bookmarks(key).into_iter().map(|(n, p, _)| PickItem { label: n.clone(), detail: String::new(), right: format!("p.{}", p + 1), arg: n }).collect(),
+            _ => Vec::new(),
+        };
+        self.overlay = Overlay::Pick(Pick::new(PickKind::Bookmarks, "Bookmarks", items));
+    }
+
+    fn open_recent(&mut self) {
+        let items: Vec<PickItem> = match &self.db {
+            Some(db) => db.recent(60).into_iter().map(|(p, t)| {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let dir = p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+                PickItem { label: name, detail: dir, right: ago(t), arg: p.to_string_lossy().into_owned() }
+            }).collect(),
+            None => Vec::new(),
+        };
+        self.overlay = Overlay::Pick(Pick::new(PickKind::Recent, "Recent files", items));
+    }
+
+    // ---- synctex ------------------------------------------------------------------------
+
+    fn synctex_view(&mut self, input: &str, line: u32, col: u32) {
+        if !self.cfg.synctex {
+            return self.err("synctex is off (set synctex true)".into());
+        }
+        match synctex::view(&self.path, input, line, col) {
+            Ok(v) => {
+                let p = (v.page as usize).min(self.layout.len() - 1);
+                let (vw, vh) = self.vp_pt();
+                self.jumps.push(self.sy);
+                self.sy = self.layout.top(p) + v.rect[1] - vh / 3.0;
+                self.sx = self.layout.left(p) + v.rect[0] - vw / 2.0;
+                self.clamp_scroll();
+                self.flash = Some((p as u32, v.rect));
+                self.msg(format!("{input}:{line} -> page {}", p + 1));
+            }
+            Err(e) => self.err(e),
+        }
+        self.redraw();
+    }
+
+    /// Ctrl+click: source location of the clicked point, handed to `synctex-editor-command`.
+    fn synctex_edit(&mut self) {
+        if !self.cfg.synctex {
+            return;
+        }
+        let s = self.scale();
+        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        if my >= self.doc_h() as f32 {
+            return;
+        }
+        let (xp, yp) = (self.x0() + mx / s, self.sy + my / s);
+        let p = self.layout.page_at(yp);
+        let (lx, ly) = (xp - self.layout.left(p), yp - self.layout.top(p));
+        match synctex::edit(&self.path, p as u32, lx, ly) {
+            Err(e) => self.err(e),
+            Ok(ed) => {
+                if self.cfg.synctex_editor_command.trim().is_empty() {
+                    self.msg(format!("{}:{} (set synctex-editor-command to open it in your editor)", ed.input, ed.line));
+                } else {
+                    match synctex::expand(&self.cfg.synctex_editor_command, &ed.input, ed.line, ed.column).and_then(|a| synctex::spawn_detached(&a)) {
+                        Ok(()) => self.msg(format!("Editor: {}:{}", ed.input, ed.line)),
+                        Err(e) => self.err(e),
+                    }
+                }
+            }
+        }
+        self.redraw();
+    }
+
+    fn on_ext(&mut self, e: Ext, el: &ActiveEventLoop) {
+        match e {
+            Ext::Signal => el.exit(),
+            Ext::Exec(line) => match keys::parse(&line) {
+                Ok(c) => self.exec(c, None, el),
+                Err(e) => self.err(e),
+            },
+            Ext::Goto(p) => {
+                self.jumps.push(self.sy);
+                self.goto_page(p.max(1) as usize - 1);
+            }
+            Ext::Open(p) => self.exec(Command::Open(p.to_string_lossy().into_owned()), None, el),
+            Ext::Synctex { input, line, column } => self.synctex_view(&input, line, column),
+        }
+        self.redraw();
+    }
+
     fn current_page(&self) -> usize {
         self.layout.page_at(self.sy + self.vp_pt().1 / 2.0)
     }
@@ -580,6 +814,25 @@ impl App {
                 self.clamp_scroll();
             }
             Command::Quit => el.exit(),
+            Command::SetMarkPrompt | Command::JumpMarkPrompt => {
+                self.mark_prompt = Some(cmd == Command::SetMarkPrompt);
+                self.msg(if cmd == Command::SetMarkPrompt { "Set mark: a-z, A-Z global".into() } else { "Jump to mark".into() });
+            }
+            Command::Mark(set, c) => {
+                if set { self.set_mark(c) } else { self.jump_mark(c, el) }
+            }
+            Command::Bmark(n) => self.bookmark_here(n),
+            Command::Blist => self.open_blist(),
+            Command::Recent => self.open_recent(),
+            Command::Bdelete(n) => {
+                let ok = matches!((&self.db, &self.key), (Some(d), Some(k)) if d.delete_bookmark(k, &n));
+                if ok { self.msg(format!("Deleted bookmark '{n}'")) } else { self.err(format!("No bookmark '{n}'")) }
+            }
+            Command::Bjump(n) => match self.db.as_ref().zip(self.key.as_ref()).and_then(|(d, k)| d.bookmark(k, &n)) {
+                Some((page, y)) => self.goto_saved(page, y),
+                None => self.err(format!("No bookmark '{n}'")),
+            },
+            Command::SynctexView(f, l, c) => self.synctex_view(&f, l, c),
             Command::CommandMode => self.overlay = Overlay::Input(InputBar::new(':')),
             Command::SearchForward => self.open_search_bar('/'),
             Command::SearchBackward => self.open_search_bar('?'),
@@ -673,6 +926,7 @@ impl App {
                 if path.is_relative() {
                     path = std::env::current_dir().unwrap_or_default().join(path);
                 }
+                self.save_state();
                 self.msg(format!("Opening {p}..."));
                 self.opening = Some((path.clone(), None));
                 let _ = self.render.req_tx.send(Cmd::Open(path));
@@ -984,6 +1238,15 @@ impl App {
 
     fn on_key(&mut self, token: String, ch: Option<char>, el: &ActiveEventLoop) {
         self.message = None;
+        self.flash = None;
+        if let (Some(set), Overlay::None) = (self.mark_prompt.take(), &self.overlay) {
+            match ch.filter(|c| c.is_ascii_alphabetic()) {
+                Some(c) => self.exec(Command::Mark(set, c), None, el),
+                None => self.err("Not a mark name".into()),
+            }
+            self.redraw();
+            return;
+        }
         // a popup opened from the list takes the keys first
         if self.popup.as_ref().is_some_and(|p| !p.hover) && matches!(self.overlay, Overlay::List(_)) {
             if let Some((cmd, count)) = self.keys.feed(&self.keymap, Mode::Popup, &token) {
@@ -1038,6 +1301,35 @@ impl App {
                     }
                 }
             }
+            Overlay::Pick(pk) => match token.as_str() {
+                "<Esc>" => {
+                    if pk.query.is_empty() {
+                        self.overlay = Overlay::None;
+                    } else {
+                        pk.query.clear();
+                        pk.sel = 0;
+                    }
+                }
+                "<BS>" => pk.backspace(),
+                "<Down>" | "<C-n>" => pk.move_sel(1),
+                "<Up>" | "<C-p>" => pk.move_sel(-1),
+                "<PgDn>" | "<C-d>" => pk.move_sel(10),
+                "<PgUp>" | "<C-u>" => pk.move_sel(-10),
+                "<CR>" => {
+                    let act = pk.current().map(|i| (pk.kind, i.arg.clone()));
+                    self.overlay = Overlay::None;
+                    match act {
+                        Some((PickKind::Bookmarks, n)) => self.exec(Command::Bjump(n), None, el),
+                        Some((PickKind::Recent, path)) => self.exec(Command::Open(path), None, el),
+                        None => {}
+                    }
+                }
+                _ => {
+                    if let Some(c) = ch.filter(|c| !c.is_control()) {
+                        pk.type_char(c);
+                    }
+                }
+            },
             Overlay::None => {
                 if let Some((cmd, count)) = self.keys.feed(&self.keymap, self.mode, &token) {
                     self.exec(cmd, count, el);
@@ -1180,6 +1472,9 @@ impl App {
                     self.name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     self.path = path;
                 }
+                if keep.is_none() {
+                    self.refresh_key();
+                }
                 self.layout = Layout::new(sizes, self.cfg.page_gap);
                 self.links.clear();
                 self.links_pending.clear();
@@ -1198,10 +1493,17 @@ impl App {
                 self.clamp_scroll();
                 self.start_analysis(false, false);
                 if keep.is_none() {
+                    self.jumps = Jumplist::default();
+                    self.restore_state();
+                    if let Some((page, y)) = self.open_goto.take() {
+                        self.sy = self.scroll_for(page, y);
+                        self.clamp_scroll();
+                    }
                     self.msg(format!("Opened {}", self.name));
                 } else {
                     self.msg("Reloaded".into());
                 }
+                self.sync_info();
             }
         }
     }
@@ -1296,6 +1598,10 @@ impl App {
                 }
             }
         }
+        if let Some((fp, r)) = self.flash {
+            let (ox, oy) = self.page_origin(fp as usize);
+            hl.push(((ox as f32 + r[0] * s) as i32, (oy as f32 + r[1] * s) as i32, ((r[2] - r[0]) * s).ceil() as i32, ((r[3] - r[1]) * s).ceil() as i32, true));
+        }
         let mut hint_draw: Vec<(i32, i32, String, usize)> = Vec::new();
         if let Overlay::Hints(hs) = &self.overlay {
             for it in &hs.items {
@@ -1316,6 +1622,7 @@ impl App {
             (Overlay::Help(_), _) => "HELP",
             (Overlay::Hints(_), _) => "HINTS",
             (Overlay::List(_), _) => "PREVIEWS",
+            (Overlay::Pick(p), _) => if p.kind == PickKind::Bookmarks { "BOOKMARKS" } else { "RECENT" },
             (_, Mode::Popup) => "PREVIEW",
             (_, Mode::Index) => "INDEX",
             _ => "NORMAL",
@@ -1359,6 +1666,8 @@ impl App {
                 help_rows = Some(crate::ui::help::draw(&mut cv, t, hp, bar));
             } else if let (Overlay::List(l), Some(pv)) = (&mut self.overlay, &self.pv) {
                 plist::draw(&mut cv, t, l, &pv.targets, bar);
+            } else if let Overlay::Pick(p) = &mut self.overlay {
+                pick::draw(&mut cv, t, p, bar);
             } else if self.mode == Mode::Index {
                 index_rows = Some(index::draw(&mut cv, t, &mut self.index, index_auto, bar));
             }
@@ -1407,6 +1716,9 @@ impl App {
 
         if page != self.title_page {
             self.title_page = page;
+            if let Ok(mut i) = self.info.lock() {
+                i.page = page as u32 + 1;
+            }
             window.set_title(&format!("strata — {} [{}/{}]", self.name, page + 1, self.layout.len()));
         }
     }
@@ -1510,7 +1822,12 @@ impl ApplicationHandler<()> for App {
         self.window = Some(window);
         self.applied.font.1 = 0.0; // re-apply font size at the real dpi
         self.apply_config();
-        self.exec(Command::FitWidth, None, el);
+        if !self.restore_state() {
+            self.exec(Command::FitWidth, None, el);
+        }
+        if let Some((f, l, c)) = self.start_synctex.take() {
+            self.synctex_view(&f, l, c);
+        }
         self.start_analysis(false, false);
     }
 
@@ -1526,7 +1843,10 @@ impl ApplicationHandler<()> for App {
         }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, _: ()) {
+    fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
+        while let Ok(e) = self.ext_rx.try_recv() {
+            self.on_ext(e, el);
+        }
         let cur = self.render.gen.load(Ordering::Relaxed);
         let mut changed = false;
         let mut tiles = false;
@@ -1599,6 +1919,11 @@ impl ApplicationHandler<()> for App {
         if tiles {
             let vis = self.visible_tiles();
             if vis.iter().all(|p| self.cache.contains(&p.key)) {
+                FIRST_TILE.call_once(|| {
+                    if debug() {
+                        eprintln!("strata: first complete frame after {:?}", START.get().map(|t| t.elapsed()).unwrap_or_default());
+                    }
+                });
                 self.cache.retain_scale(self.scale_key());
             }
         }
@@ -1610,6 +1935,7 @@ impl ApplicationHandler<()> for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
         match ev {
             WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::Focused(false) => self.save_state(),
             WindowEvent::RedrawRequested => self.paint(),
             WindowEvent::Resized(sz) => {
                 self.vp = (sz.width, sz.height);
@@ -1634,7 +1960,11 @@ impl ApplicationHandler<()> for App {
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if matches!(self.overlay, Overlay::None) && self.mode == Mode::Normal {
-                    self.click();
+                    if self.mods.control_key() && self.cfg.synctex {
+                        self.synctex_edit();
+                    } else {
+                        self.click();
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -1659,6 +1989,7 @@ impl ApplicationHandler<()> for App {
                             l.move_sel(-(dy * 3.0) as i32, &pv.targets);
                         }
                     }
+                    Overlay::Pick(p) => p.move_sel(-(dy * 3.0) as i32),
                     Overlay::Help(h) => h.scroll_by(-(dy * 3.0) as i32, self.help_rows),
                     _ if self.mode == Mode::Index => {
                         if dy > 0.0 { self.index.up((dy * 3.0) as usize) } else { self.index.down((-dy * 3.0) as usize) }
@@ -1675,3 +2006,15 @@ impl ApplicationHandler<()> for App {
 
 #[allow(dead_code)]
 fn _assert_tile_send(_: Tile) {}
+
+/// "3 h ago" style age for the recent-files list.
+fn ago(t: i64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let d = (now - t).max(0);
+    match d {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86399 => format!("{} h ago", d / 3600),
+        _ => format!("{} d ago", d / 86400),
+    }
+}

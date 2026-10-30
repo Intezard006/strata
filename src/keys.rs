@@ -72,6 +72,18 @@ pub enum Command {
     /// List of all previewable targets.
     Previews,
     PreviewHints,
+    /// `m`: the next key names a mark to set.
+    SetMarkPrompt,
+    /// `'`: the next key names a mark to jump to.
+    JumpMarkPrompt,
+    Bmark(String),
+    Blist,
+    Bdelete(String),
+    Bjump(String),
+    Recent,
+    SynctexView(String, u32, u32),
+    /// Mark commands reached by D-Bus/prompt: set (true) or jump (false) to a mark.
+    Mark(bool, char),
     PopupClose,
     PopupJump,
     PopupDown,
@@ -136,6 +148,16 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("index-last", "", "Index: last entry"),
     ("previews", "", "List all equations, theorems, figures... and preview or jump to one"),
     ("preview-hints", "", "Show hint labels over references; type one to preview its target"),
+    ("mark-prompt", "", "Set a mark: the next key a-z (local) or A-Z (global) names it"),
+    ("jump-mark-prompt", "", "Jump to a mark: the next key names it"),
+    ("bmark", "NAME", "Bookmark the current position as NAME"),
+    ("blist", "", "List bookmarks (type to filter, Enter jumps)"),
+    ("bdelete", "NAME", "Delete the bookmark NAME"),
+    ("bjump", "NAME", "Jump to the bookmark NAME"),
+    ("recent", "", "List recently opened files (Enter opens)"),
+    ("mark", "KEY", "Set mark KEY (a-z local, A-Z global); same as m KEY"),
+    ("jump-mark", "KEY", "Jump to mark KEY; same as ' KEY"),
+    ("synctex-view", "LINE:COL:FILE", "Forward search: show the PDF position of a TeX source line"),
     ("popup-close", "", "Preview: close the popup"),
     ("popup-jump", "", "Preview: jump to the target (Ctrl-o returns)"),
     ("popup-down", "", "Preview: scroll down"),
@@ -218,6 +240,30 @@ pub fn parse_words(name: &str, args: &[String]) -> Result<Command, String> {
         "index-last" => IndexLast,
         "previews" => Previews,
         "preview-hints" => PreviewHints,
+        "mark-prompt" => SetMarkPrompt,
+        "jump-mark-prompt" => JumpMarkPrompt,
+        "bmark" => Bmark(rest()?),
+        "blist" => Blist,
+        "bdelete" => Bdelete(rest()?),
+        "bjump" => Bjump(rest()?),
+        "recent" => Recent,
+        "mark" | "jump-mark" => {
+            let c = one()?;
+            let mut cs = c.chars();
+            match (cs.next(), cs.next()) {
+                (Some(ch), None) if ch.is_ascii_alphabetic() => Mark(name == "mark", ch),
+                _ => return Err(format!("{name}: expected one letter")),
+            }
+        }
+        "synctex-view" => {
+            let a = rest()?;
+            let mut p = a.splitn(3, ':');
+            let (l, c, f) = (p.next().and_then(|v| v.parse().ok()), p.next().and_then(|v| v.parse().ok()), p.next());
+            match (l, c, f) {
+                (Some(l), Some(c), Some(f)) => SynctexView(f.to_string(), l, c),
+                _ => return Err("synctex-view: expected LINE:COL:FILE".into()),
+            }
+        }
         "popup-close" => PopupClose,
         "popup-jump" => PopupJump,
         "popup-down" => PopupDown,
@@ -303,6 +349,9 @@ const DEFAULTS: &[(Mode, &str, &str)] = &[
     (Mode::Normal, "q", "quit"),
     (Mode::Normal, "p", "preview-hints"),
     (Mode::Normal, "gp", "previews"),
+    (Mode::Normal, "m", "mark-prompt"),
+    (Mode::Normal, "'", "jump-mark-prompt"),
+    (Mode::Normal, "gb", "blist"),
     (Mode::Popup, "<CR>", "popup-jump"),
     (Mode::Popup, "o", "popup-jump"),
     (Mode::Popup, "j", "popup-down"),

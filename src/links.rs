@@ -68,7 +68,18 @@ impl Jumplist {
     pub fn push(&mut self, cur: f32) {
         self.list.truncate(self.pos);
         self.list.push(cur);
+        if self.list.len() > crate::db::JUMPS_MAX {
+            self.list.remove(0);
+        }
         self.pos = self.list.len();
+    }
+
+    pub fn from_saved(pos: usize, list: Vec<f32>) -> Self {
+        Jumplist { pos: pos.min(list.len()), list }
+    }
+
+    pub fn saved(&self) -> (usize, &[f32]) {
+        (self.pos, &self.list)
     }
 
     pub fn back(&mut self, cur: f32) -> Option<f32> {
@@ -95,6 +106,19 @@ impl Jumplist {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jumplist_bounded_and_restorable() {
+        let mut j = Jumplist::default();
+        for i in 0..150 {
+            j.push(i as f32);
+        }
+        assert_eq!(j.saved().1.len(), crate::db::JUMPS_MAX);
+        assert_eq!(j.saved().1[0], 50.0);
+        let (pos, list) = j.saved();
+        let mut k = Jumplist::from_saved(pos, list.to_vec());
+        assert_eq!(k.back(999.0), Some(149.0));
+    }
 
     #[test]
     fn labels() {

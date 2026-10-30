@@ -25,6 +25,14 @@ set auto-analyze         true
 set auto-ocr             true     # OCR scanned documents with ocrmypdf
 set auto-index           auto     # auto: only when the file has no outline | always | off
 
+# State (position, bookmarks, marks) lives in ~/.local/share/strata/strata.db
+set restore-position     true     # reopen at the last page, zoom and recolor state
+
+# SyncTeX (vimtex): Ctrl+click on the page runs synctex edit, then this command.
+# %{input} %{line} %{column} are substituted; the value is split like a shell line, no shell is involved.
+set synctex              true
+# set synctex-editor-command "nvim --server /tmp/vimtexserver.pipe --remote-expr \"vimtex#view#inverse_search(%{line}, '%{input}')\""
+
 # map [mode] KEYS COMMAND     (modes: normal, index)
 map <C-x> goto 1
 # unmap <Space>

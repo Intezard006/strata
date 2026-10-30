@@ -1,0 +1,55 @@
+# Maintainer: intezard006
+# Builds strata from the local git checkout (the directory above this one):
+#   cd packaging && makepkg -f        (add -i or pacman -U to install)
+pkgname=strata-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Keyboard-driven PDF/EPUB reader for Wayland with a study index, OCR and previews'
+arch=('x86_64')
+url='https://github.com/intezard006/strata'
+license=('custom')
+depends=('sqlite' 'dbus' 'fontconfig' 'wayland' 'libxkbcommon' 'gcc-libs' 'glibc')
+makedepends=('rust' 'clang' 'make' 'git' 'pkgconf')
+optdepends=('ocrmypdf: OCR for scanned documents (pipx install ocrmypdf also works)'
+            'wl-clipboard: copy from preview popups'
+            'xdg-utils: open external links'
+            'texlive-binextra: synctex for LaTeX forward/backward search')
+provides=('strata')
+conflicts=('strata')
+options=('!lto')
+_repo="$(dirname "$PWD")"
+source=("strata::git+file://${_repo}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd strata
+  printf '0.1.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd strata
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd strata
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --release --frozen
+}
+
+check() {
+  cd strata
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --release --frozen
+}
+
+package() {
+  cd strata
+  install -Dm755 target/release/strata "$pkgdir/usr/bin/strata"
+  install -Dm644 packaging/strata.desktop "$pkgdir/usr/share/applications/strata.desktop"
+  install -Dm644 stratarc.example "$pkgdir/usr/share/doc/strata/stratarc.example"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/strata/README.md"
+  install -Dm755 contrib/textbook-toggle.sh "$pkgdir/usr/share/doc/strata/textbook-toggle.sh"
+}

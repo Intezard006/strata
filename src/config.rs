@@ -23,6 +23,9 @@ pub struct Config {
     pub previews: bool,
     pub preview_hover_ms: u64,
     pub preview_max_scale: f32,
+    pub restore_position: bool,
+    pub synctex: bool,
+    pub synctex_editor_command: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +57,9 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("previews", "Hover/keyboard previews of equations, theorems, figures (true/false)"),
     ("preview-hover-ms", "Hover time before a preview popup opens, in ms"),
     ("preview-max-scale", "Maximum render scale of the popup (1 = 100%)"),
+    ("restore-position", "Reopen documents at the last position, zoom and recolor state (true/false)"),
+    ("synctex", "SyncTeX forward/backward search (true/false)"),
+    ("synctex-editor-command", "Run on Ctrl+click; %{input} %{line} %{column} are substituted (quote the value)"),
 ];
 
 impl Default for Config {
@@ -76,6 +82,9 @@ impl Default for Config {
             previews: true,
             preview_hover_ms: 300,
             preview_max_scale: 3.0,
+            restore_position: true,
+            synctex: true,
+            synctex_editor_command: String::new(),
         }
     }
 }
@@ -159,6 +168,9 @@ impl Config {
             "previews" => self.previews = parse_bool(v)?,
             "preview-hover-ms" => self.preview_hover_ms = parse_num(v, 0.0, 5000.0)? as u64,
             "preview-max-scale" => self.preview_max_scale = parse_num(v, 0.5, 8.0)?,
+            "restore-position" => self.restore_position = parse_bool(v)?,
+            "synctex" => self.synctex = parse_bool(v)?,
+            "synctex-editor-command" => self.synctex_editor_command = v.to_string(),
             "auto-index" => {
                 self.auto_index = match v {
                     "auto" => AutoIndex::Auto,
@@ -193,6 +205,9 @@ impl Config {
             "previews" => self.previews.to_string(),
             "preview-hover-ms" => self.preview_hover_ms.to_string(),
             "preview-max-scale" => self.preview_max_scale.to_string(),
+            "restore-position" => self.restore_position.to_string(),
+            "synctex" => self.synctex.to_string(),
+            "synctex-editor-command" => self.synctex_editor_command.clone(),
             "auto-index" => format!("{:?}", self.auto_index).to_lowercase(),
             _ => return None,
         })
