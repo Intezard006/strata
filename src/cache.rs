@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Bump to invalidate every cached result.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 const SAMPLE: u64 = 64 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

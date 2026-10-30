@@ -1548,19 +1548,39 @@ impl App {
     /// Open the popup for the reference the mouse rests on.
     fn hover_fire(&mut self) {
         let Some((page, i)) = self.hover.key else { return };
-        let Some(target) = self.refs_for(page).get(i).map(|r| r.target) else { return };
-        self.open_popup(target, (self.cursor.0 as i32, self.cursor.1 as i32), true);
+        let Some((target, rect)) = self.refs_for(page).get(i).map(|r| (r.target, r.rect)) else { return };
+        self.open_popup(target, Some((page, rect)), true);
         self.redraw();
     }
 
-    fn open_popup(&mut self, target: u32, anchor: (i32, i32), hover: bool) {
+    fn open_popup(&mut self, target: u32, from: Option<(u32, [f32; 4])>, hover: bool) {
         let Some(pv) = &self.pv else { return };
         let Some(t) = pv.targets.get(target as usize) else { return };
-        let title = if t.kind == Kind::Link { format!("Destination — p.{}", t.page + 1) } else { format!("{} — p.{}", t.title(), t.page + 1) };
+        let map = self.analysis.as_ref().map(|a| &a.page_map);
+        let at = format!("p.{}", pages::label(map, t.page));
+        let delta = t.page as i64 - self.current_page() as i64;
+        let far = if delta >= 30 { format!(" (ahead {delta} pages)") } else if delta <= -30 { format!(" (back {} pages)", -delta) } else { String::new() };
+        let title = if t.kind == Kind::Link { format!("Destination — {at}{far}") } else { format!("{} — {at}{far}", t.title()) };
+        // a target that is already fully on screen is highlighted instead of previewed
+        let s = self.scale();
+        let (ox, oy) = self.page_origin(t.page as usize);
+        let (ty0, ty1) = (oy as f32 + t.rect[1] * s, oy as f32 + t.rect[3] * s);
+        let (tx0, tx1) = (ox as f32 + t.rect[0] * s, ox as f32 + t.rect[2] * s);
+        if t.kind != Kind::Link && ty0 >= 0.0 && ty1 <= self.doc_h() as f32 && tx0 >= 0.0 && tx1 <= self.vp.0 as f32 {
+            self.flash = Some((t.page, t.rect));
+            self.msg(format!("{} is on screen", t.title()));
+            self.redraw();
+            return;
+        }
+        let ref_rect = from.map(|(pg, r)| {
+            let (ox, oy) = self.page_origin(pg as usize);
+            ((ox as f32 + r[0] * s) as i32, (oy as f32 + r[1] * s) as i32, (ox as f32 + r[2] * s) as i32, (oy as f32 + r[3] * s) as i32)
+        });
+        let anchor = (self.cursor.0 as i32, self.cursor.1 as i32);
         if debug() {
             eprintln!("open popup target {target} hover={hover}");
         }
-        self.popup = Some(Popup { target, id: 0, tile: None, zoom: 1.0, scroll: 0, hover, anchor, title, rect: (0, 0, 0, 0) });
+        self.popup = Some(Popup { target, id: 0, tile: None, zoom: 1.0, scroll: 0, hover, anchor, ref_rect, title, rect: (0, 0, 0, 0) });
         if !hover {
             self.mode = Mode::Popup;
         }
@@ -1698,12 +1718,12 @@ impl App {
                     }
                     "<Tab>" => {
                         if let Some(id) = l.current(tg) {
-                            self.open_popup(id, (0, 0), false);
+                            self.open_popup(id, None, false);
                         }
                     }
                     "<Space>" if l.query.is_empty() => {
                         if let Some(id) = l.current(tg) {
-                            self.open_popup(id, (0, 0), false);
+                            self.open_popup(id, None, false);
                         }
                     }
                     _ => {
@@ -1778,9 +1798,10 @@ impl App {
                     if let Some(i) = h.items.iter().position(|i| i.label == typed) {
                         let t = h.items[i].target.clone();
                         let pv = h.items[i].pv;
+                        let (hint_page, hint_rect) = (h.items[i].page, h.items[i].rect);
                         self.overlay = Overlay::None;
                         match pv {
-                            Some(id) => self.open_popup(id, (0, 0), false),
+                            Some(id) => self.open_popup(id, Some((hint_page, hint_rect)), false),
                             None => self.follow(&t),
                         }
                     } else if !h.items.iter().any(|i| i.label.starts_with(&typed)) {
@@ -2052,6 +2073,7 @@ impl App {
         let job_text = self.job_status.clone();
         let index_auto = self.index_auto;
         let search_pos = self.search.as_ref().map(|s| (s.index().map_or(0, |i| i + 1), s.hits.len(), s.done));
+        let panel_bg = self.cfg.preview_bg;
         let bar_visible = self.cfg.statusbar && !self.in_float && !self.float_solo;
         let under = !self.cfg.recolor.enabled;
         let bg = self.bg;
@@ -2094,7 +2116,7 @@ impl App {
                 index_rows = Some(index::draw(&mut cv, t, &mut self.index, index_auto, self.analysis.as_ref().map(|a| &a.page_map), bar));
             }
             if let Some(p) = self.popup.as_mut() {
-                popup::draw(&mut cv, t, p);
+                popup::draw(&mut cv, t, p, bar, panel_bg);
             }
             if bar_visible {
                 let st = Status {

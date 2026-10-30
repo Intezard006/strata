@@ -16,6 +16,8 @@ pub struct Popup {
     /// Opened by hovering (closes when the mouse leaves); otherwise by keyboard.
     pub hover: bool,
     pub anchor: (i32, i32),
+    /// The reference this popup explains, in window pixels (x0, y0, x1, y1); the panel avoids covering it.
+    pub ref_rect: Option<(i32, i32, i32, i32)>,
     pub title: String,
     /// Last drawn panel rectangle (x, y, w, h), for hit testing.
     pub rect: (i32, i32, i32, i32),
@@ -80,7 +82,8 @@ impl HoverTimer {
     }
 }
 
-const PAD: i32 = 8;
+const PAD: i32 = 10;
+const GAP: i32 = 8;
 
 /// Panel size for a tile inside a window of `vw` x `vh`.
 pub fn panel_size(tile: Option<&Tile>, vw: i32, vh: i32, zoom: f32, line_h: i32) -> (i32, i32) {
@@ -90,27 +93,38 @@ pub fn panel_size(tile: Option<&Tile>, vw: i32, vh: i32, zoom: f32, line_h: i32)
     ((tw + 2 * PAD).min(max_w), (th + 2 * PAD + line_h + 4).min(max_h))
 }
 
-pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup) {
-    let (w, h) = panel_size(p.tile.as_ref(), cv.w, cv.h, p.zoom, t.line_h);
-    let (mut x, mut y) = if p.hover {
-        (p.anchor.0 + 12, p.anchor.1 + 14)
-    } else {
-        ((cv.w - w) / 2, (cv.h - h) / 2)
-    };
-    if x + w > cv.w {
-        x = (p.anchor.0 - w - 12).max(0).min(cv.w - w);
-        if p.hover && x < p.anchor.0 && x + w > p.anchor.0 {
-            x = (cv.w - w).max(0);
+/// Panel position: below the reference when it fits, else above, else wherever it fits best; never
+/// over the reference line. Without a reference (list popups) it is centred.
+pub fn place(w: i32, h: i32, vw: i32, vh: i32, rr: Option<(i32, i32, i32, i32)>, anchor: (i32, i32)) -> (i32, i32) {
+    let clampx = |x: i32| x.min(vw - w).max(0);
+    match rr {
+        Some((x0, y0, _x1, y1)) => {
+            let x = clampx(x0 - PAD);
+            let below = y1 + GAP;
+            let above = y0 - GAP - h;
+            if below + h <= vh {
+                (x, below)
+            } else if above >= 0 {
+                (x, above)
+            } else if vh - y1 >= y0 {
+                (x, (vh - h).max(y1 + 1).min(vh - h))
+            } else {
+                (x, 0)
+            }
         }
+        None if anchor != (0, 0) => (clampx(anchor.0 + 12), (anchor.1 + 14).min(vh - h).max(0)),
+        None => ((vw - w) / 2, ((vh - h) / 2).max(0)),
     }
-    if y + h > cv.h {
-        y = (p.anchor.1 - h - 14).max(0);
-        if y + h > cv.h {
-            y = (cv.h - h).max(0);
-        }
-    }
+}
+
+pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup, bottom_reserved: i32, bg: [u8; 4]) {
+    let vh = cv.h - bottom_reserved;
+    let (w, h) = panel_size(p.tile.as_ref(), cv.w, vh, p.zoom, t.line_h);
+    let (x, y) = place(w, h, cv.w, vh, p.ref_rect, p.anchor);
     p.rect = (x, y, w, h);
-    cv.fill_rect(x, y, w, h, pm([0x1e, 0x1e, 0x2e], 0xe6));
+    // opaque base first, so nothing of the page shows through, then the (nearly opaque) panel colour
+    cv.fill_rect(x, y, w, h, pm([bg[0] / 2, bg[1] / 2, bg[2] / 2], 0xff));
+    cv.fill_rect(x, y, w, h, pm([bg[0], bg[1], bg[2]], bg[3]));
     for (bx, by, bw, bh) in [(x, y, w, 1), (x, y + h - 1, w, 1), (x, y, 1, h), (x + w - 1, y, 1, h)] {
         cv.fill_rect(bx, by, bw, bh, pm(ACCENT, 0xff));
     }
@@ -167,6 +181,6 @@ mod tests {
         let (w, _) = panel_size(Some(&tile), 1000, 800, 2.0, 16);
         assert_eq!(w, 950);
         let small = Tile { w: 100, h: 50, data: vec![] };
-        assert_eq!(panel_size(Some(&small), 1000, 800, 1.0, 16).0, 116);
+        assert_eq!(panel_size(Some(&small), 1000, 800, 1.0, 16).0, 120);
     }
 }

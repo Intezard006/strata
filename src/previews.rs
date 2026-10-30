@@ -135,15 +135,32 @@ struct Row {
 }
 
 /// Fragments sharing a baseline (OCR words, equation labels, scripts) become one row.
+/// `Table6.1` (kerned small caps drop the space): split a caption keyword from the number glued to it.
+fn split_glued(w: &W) -> Vec<W> {
+    for kw in ["Figure", "Table", "Scheme", "Chart", "Fig."] {
+        if let Some(rest) = w.t.strip_prefix(kw) {
+            if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                let cut = w.x0 + (w.x1 - w.x0) * kw.len() as f32 / w.t.chars().count().max(1) as f32;
+                return vec![W { t: kw.to_string(), x1: cut, ..w.clone() }, W { t: rest.to_string(), x0: cut, ..w.clone() }];
+            }
+        }
+    }
+    vec![w.clone()]
+}
+
 fn rows(lines: &[PLine]) -> Vec<Row> {
     let mut sorted: Vec<&PLine> = lines.iter().filter(|l| !l.words.is_empty()).collect();
     sorted.sort_by(|a, b| a.y0.total_cmp(&b.y0));
     let mut groups: Vec<Vec<&PLine>> = Vec::new();
     for l in sorted {
+        // same baseline band, and not a tall drawing fragment swallowing the small text beside it
         let same = groups.last().is_some_and(|g| {
-            let f = g[0];
-            let overlap = f.y1.min(l.y1) - f.y0.max(l.y0);
-            overlap >= 0.5 * (f.y1 - f.y0).min(l.y1 - l.y0) && overlap > 0.0
+            g.iter().any(|f| {
+                let (hf, hl) = ((f.y1 - f.y0).max(0.1), (l.y1 - l.y0).max(0.1));
+                let overlap = f.y1.min(l.y1) - f.y0.max(l.y0);
+                let dc = ((f.y0 + f.y1) - (l.y0 + l.y1)).abs() / 2.0;
+                overlap >= 0.5 * hf.min(hl) && overlap > 0.0 && hf.max(hl) <= 1.8 * hf.min(hl) && dc <= 0.4 * hf.max(hl)
+            })
         });
         if same {
             groups.last_mut().unwrap().push(l);
@@ -151,24 +168,41 @@ fn rows(lines: &[PLine]) -> Vec<Row> {
             groups.push(vec![l]);
         }
     }
-    groups
-        .into_iter()
-        .map(|g| {
-            let main = g.iter().max_by_key(|l| l.words.len()).unwrap();
-            let mut words: Vec<W> = g.iter().flat_map(|l| l.words.iter().cloned()).collect();
-            words.sort_by(|a, b| a.x0.total_cmp(&b.x0));
-            Row {
-                x0: words[0].x0,
-                x1: words.iter().map(|w| w.x1).fold(0.0, f32::max),
-                y0: g.iter().map(|l| l.y0).fold(f32::MAX, f32::min),
-                y1: g.iter().map(|l| l.y1).fold(0.0, f32::max),
-                size: main.size,
-                bold: main.bold,
-                text: words.iter().map(|w| w.t.as_str()).collect::<Vec<_>>().join(" "),
-                words,
+    let mk = |words: Vec<W>, y0: f32, y1: f32, size: f32, bold: bool| Row {
+        x0: words[0].x0,
+        x1: words.iter().map(|w| w.x1).fold(0.0, f32::max),
+        y0,
+        y1,
+        size,
+        bold,
+        text: words.iter().map(|w| w.t.as_str()).collect::<Vec<_>>().join(" "),
+        words,
+    };
+    let mut out = Vec::new();
+    for g in groups {
+        let main = g.iter().max_by_key(|l| l.words.len()).unwrap();
+        let mut words: Vec<W> = g.iter().flat_map(|l| l.words.iter().flat_map(split_glued)).collect();
+        words.sort_by(|a, b| a.x0.total_cmp(&b.x0));
+        let y0 = g.iter().map(|l| l.y0).fold(f32::MAX, f32::min);
+        let y1 = g.iter().map(|l| l.y1).fold(0.0, f32::max);
+        // a caption sharing a baseline with figure labels on its left (`cr(out)   Figure 1.10`) is its own row
+        let cut = (1..words.len()).find(|&k| {
+            is_caption_kw(&words[k].t) && words.get(k + 1).is_some_and(|n| plain_label(trim_tail(&n.t)).is_some()) && words[k].x0 - words[k - 1].x1 > 3.0 * main.size.max(6.0)
+        });
+        match cut {
+            Some(k) => {
+                let right = words.split_off(k);
+                out.push(mk(words, y0, y1, main.size, main.bold));
+                out.push(mk(right, y0, y1, main.size, main.bold));
             }
-        })
-        .collect()
+            None => out.push(mk(words, y0, y1, main.size, main.bold)),
+        }
+    }
+    out
+}
+
+fn is_caption_kw(t: &str) -> bool {
+    matches!(trim_tail(t), "Figure" | "Table" | "Scheme" | "Chart")
 }
 
 struct Metrics {
@@ -373,6 +407,13 @@ fn prose_like(r: &Row) -> bool {
     r.words.iter().filter(|w| w.t.chars().filter(|c| c.is_alphabetic()).count() >= 3).count() >= 7
 }
 
+/// A body-text line: prose-like, nearly full width and without the big gaps of figure labels
+/// that merely share a baseline.
+fn solid_prose(r: &Row, m: &Metrics) -> bool {
+    let gap = r.words.windows(2).map(|w| w[1].x0 - w[0].x1).fold(0.0, f32::max);
+    prose_like(r) && r.x1 - r.x0 > 0.6 * m.bw && gap < 2.5 * r.size.max(6.0)
+}
+
 fn is_label_row(r: &Row) -> bool {
     r.words.last().is_some_and(|w| eq_tag(&w.t).is_some())
 }
@@ -545,21 +586,31 @@ fn find_captions(p: &PageIn, rows: &[Row], m: &Metrics, out: &mut Vec<Target>) {
             if top < from - 1.0 {
                 return top;
             }
-            let prose_end = rows[..i].iter().rev().find(|x| prose_like(x) && x.x1 - x.x0 > 0.6 * m.bw).map_or(0.0, |x| x.y1);
+            // never above the running page header
+            let header = rows.iter().take_while(|x| x.y0 < 0.08 * p.h).map(|x| x.y1).fold(0.0, f32::max);
+            let prose_end = rows[..i].iter().rev().find(|x| solid_prose(x, m)).map_or(header, |x| x.y1.max(header));
             prose_end + 3.0
         };
         let below = || -> f32 {
-            let prose = rows[cend + 1..].iter().find(|x| prose_like(x) && x.x1 - x.x0 > 0.6 * m.bw).map_or(p.h - 20.0, |x| x.y0);
+            let prose = rows[cend + 1..].iter().find(|x| solid_prose(x, m)).map_or(p.h - 20.0, |x| x.y0);
             prose - 2.0
         };
-        let (y0, y1) = if kind == Kind::Table {
+        // `caption_last`: the caption sits at the bottom of the region (figure above its caption)
+        let (y0, y1, caption_last) = if kind == Kind::Table {
             let b = below();
-            if b - cap_y1 > 30.0 { (cap_y0, b) } else { (above(cap_y0), cap_y1) }
+            if b - cap_y1 > 30.0 { (cap_y0, b, false) } else { (above(cap_y0), cap_y1, true) }
         } else {
             let a = above(cap_y0);
-            if cap_y0 - a > 25.0 { (a, cap_y1) } else { (cap_y0, below().min(cap_y1 + 200.0)) }
+            if cap_y0 - a > 25.0 { (a, cap_y1, true) } else { (cap_y0, below().min(cap_y1 + 200.0), false) }
         };
-        let (y0, y1) = if y1 - y0 > cap_h { (y1 - cap_h, y1) } else { (y0, y1) };
+        // an over-tall region keeps the end that holds the caption
+        let (y0, y1) = if y1 - y0 <= cap_h {
+            (y0, y1)
+        } else if caption_last {
+            (y1 - cap_h, y1)
+        } else {
+            (y0, y0 + cap_h)
+        };
         let mut x0 = m.lm.min(r.x0);
         let mut x1 = m.rm;
         for im in p.images.iter().filter(|im| im[1] >= y0 - 2.0 && im[3] <= y1 + 2.0) {
@@ -575,6 +626,11 @@ fn find_captions(p: &PageIn, rows: &[Row], m: &Metrics, out: &mut Vec<Target>) {
             text: truncate(&body.join(" "), 80),
         });
     }
+}
+
+/// Developer aid: the merged rows of a page with their geometry.
+pub fn debug_rows(p: &PageIn) -> Vec<String> {
+    rows(&p.lines).iter().map(|r| format!("y {:6.1}-{:6.1} x {:5.1}-{:5.1} sz {:4.1} | {}", r.y0, r.y1, r.x0, r.x1, r.size, r.text)).collect()
 }
 
 /// Targets and references found on one page.
@@ -650,7 +706,15 @@ impl Resolver<'_> {
             let t = &self.targets[i as usize];
             !(t.page == r.page && inside(&r.rect, &t.rect)) // a reference inside its own target
         };
-        let cands: Vec<u32> = cands.iter().filter(ok).copied().collect();
+        // a bare number (`Rule 4`, `Exercise 7`) is numbered within its chapter: the target must be close
+        // (same chapter, else within 40 pages), not the same-numbered item of a distant appendix
+        let bare = !r.label.contains('.') && !matches!(r.kind, Kind::Section | Kind::Chapter | Kind::Equation | Kind::Figure | Kind::Table | Kind::Scheme | Kind::Chart);
+        let ch = self.chapter_of.get(r.page as usize).copied();
+        let near = |i: &u32| {
+            let t = &self.targets[*i as usize];
+            !bare || (t.page as i64 - r.page as i64).abs() <= 40 || (ch.is_some() && self.chapter_of.get(t.page as usize).copied() == ch)
+        };
+        let cands: Vec<u32> = cands.iter().filter(ok).filter(|i| near(i)).copied().collect();
         match cands.len() {
             0 => None,
             1 => Some(cands[0]),

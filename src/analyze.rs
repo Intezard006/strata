@@ -573,6 +573,10 @@ pub fn dump_previews(args: &[String]) -> ExitCode {
         state ^= state << 17;
         let (p, r) = all[(state % all.len() as u64) as usize];
         let t = &store.targets[r.target as usize];
+        if std::env::var_os("FAR").is_some() && (t.page as i64 - p as i64).abs() <= 60 {
+            all.retain(|(pp, rr)| !(*pp == p && rr.target == r.target));
+            continue;
+        }
         if only.as_ref().is_some_and(|k| k != t.kind.name()) {
             if rc.get(only.as_ref().unwrap()).is_none() {
                 break;
@@ -589,4 +593,47 @@ pub fn dump_previews(args: &[String]) -> ExitCode {
 
 fn text_in(doc: &Document, p: u32, r: [f32; 4]) -> String {
     crate::render::text_in_rect(doc, p, r).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `strata --dump-recall <file> [kind]`: for each kind, distinct labels referenced in the text versus
+/// labels found as targets (developer aid for tuning recall).
+pub fn dump_recall(args: &[String]) -> ExitCode {
+    use std::collections::{BTreeMap, BTreeSet};
+    let Some(f) = args.first() else { return ExitCode::from(2) };
+    let only = args.get(1).cloned();
+    let Ok(doc) = open_doc(&PathBuf::from(f)) else { return ExitCode::FAILURE };
+    let n = doc.page_count().unwrap_or(0) as usize;
+    let mut refd: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for p in 0..n {
+        let Some(info) = analyze_page(&doc, p, true) else { continue };
+        let Some(pin) = info.pin else { continue };
+        if std::env::var("STRATA_ROWS").ok().and_then(|v| v.parse::<usize>().ok()) == Some(p + 1) {
+            for l in previews::debug_rows(&pin) {
+                println!("{l}");
+            }
+            println!("images {:?}", pin.images);
+        }
+        let (t, r) = previews::extract_page(&pin);
+        for t in t {
+            if std::env::var("STRATA_ROWS").ok().and_then(|v| v.parse::<usize>().ok()) == Some(p + 1) {
+                println!("TARGET {} {:?}", t.title(), t.rect);
+            }
+            found.entry(t.kind.name().to_string()).or_default().insert(t.label);
+        }
+        for r in r {
+            refd.entry(r.kind.name().to_string()).or_default().entry(r.label).or_insert(p as u32 + 1);
+        }
+    }
+    for (k, labels) in &refd {
+        if only.as_ref().is_some_and(|o| o != k) {
+            continue;
+        }
+        let have = found.get(k);
+        let missing: Vec<(&String, &u32)> = labels.iter().filter(|(l, _)| !have.is_some_and(|h| h.contains(*l))).collect();
+        println!("{k}: referenced {} distinct labels, {} found as targets, {} missing", labels.len(), labels.len() - missing.len(), missing.len());
+        let shown: Vec<String> = missing.iter().take(25).map(|(l, p)| format!("{l}@p{p}")).collect();
+        println!("   missing e.g. {}", shown.join(" "));
+    }
+    ExitCode::SUCCESS
 }
