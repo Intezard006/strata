@@ -94,6 +94,8 @@ struct View {
     title_page: usize,
     /// Keep fitting the page (or region) to the window width until the user zooms.
     fit: bool,
+    /// wl_surface pointer of the window (pinch events name their surface).
+    sid: usize,
     /// Target region (page, rect in points) the float was opened on.
     region: Option<(usize, [f32; 4])>,
 }
@@ -181,6 +183,7 @@ pub struct App {
     key: Option<String>,
     info: SharedInfo,
     ext_rx: Receiver<Ext>,
+    ext_tx: Sender<Ext>,
     /// After `m` (true) or `'` (false): the next key names the mark.
     mark_prompt: Option<bool>,
     /// A position to go to once the document in `opening` is loaded (global marks).
@@ -189,6 +192,14 @@ pub struct App {
     flash: Option<(u32, [f32; 4])>,
     /// A forward search to run once the window is up (`--synctex-forward` on a fresh start).
     start_synctex: Option<(String, u32, u32)>,
+    /// Main window's wl_surface pointer.
+    main_sid: usize,
+    /// While a pinch / Ctrl+wheel zoom is moving no new tiles are requested (cached ones are scaled);
+    /// they are requested when it pauses or ends.
+    zoom_hold: bool,
+    zoom_settle: Option<Instant>,
+    /// Running pinch: the zoom it started from and whether it acts on the float window.
+    pinch: Option<(f32, bool)>,
     float: Option<View>,
     float_fit: bool,
     float_target: Option<(usize, Option<[f32; 4]>)>,
@@ -220,7 +231,7 @@ impl App {
         let (ext_tx, ext_rx) = channel();
         let info: SharedInfo = Default::default();
         ext::spawn_signals(ext_tx.clone(), proxy.clone());
-        ext::spawn_dbus(ext_tx, proxy.clone(), info.clone());
+        ext::spawn_dbus(ext_tx.clone(), proxy.clone(), info.clone());
         let db = Db::open(&db::db_path()).ok();
         let key = cache::key(&path).ok();
         if let (Some(d), Some(k)) = (&db, &key) {
@@ -285,10 +296,15 @@ impl App {
             key,
             info,
             ext_rx,
+            ext_tx,
             mark_prompt: None,
             open_goto: None,
             flash: None,
             start_synctex: opts.synctex,
+            main_sid: 0,
+            zoom_hold: false,
+            zoom_settle: None,
+            pinch: None,
             float: None,
             float_fit: true,
             float_target: None,
@@ -847,6 +863,7 @@ impl App {
             cursor: (0.0, 0.0),
             pending: HashSet::new(),
             title_page: usize::MAX,
+            sid: surface_id(&*window),
             fit: true,
             region,
         };
@@ -932,7 +949,7 @@ impl App {
                 self.in_float_view(|a| {
                     if ctrl {
                         a.float_fit_off();
-                        a.set_zoom(a.zoom * a.zoom_factor(1).powf(dy));
+                        a.pinch_zoom(a.zoom * a.zoom_factor(1).powf(dy));
                     } else {
                         let k = WHEEL_PX * a.dpi;
                         a.scroll_by(-dx * k, -dy * k);
@@ -1077,6 +1094,24 @@ impl App {
     fn on_ext(&mut self, e: Ext, el: &ActiveEventLoop) {
         match e {
             Ext::Signal => el.exit(),
+            Ext::Exec(line) if debug() && line.starts_with("debug-pinch") => {
+                // developer aid: a synthetic pinch of 20 steps from 1.0 to the given scale
+                let to: f64 = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(2.0);
+                let (tx, proxy, sid) = (self.ext_tx.clone(), self.proxy.clone(), self.main_sid);
+                std::thread::spawn(move || {
+                    let send = |e| {
+                        let _ = tx.send(e);
+                        let _ = proxy.send_event(());
+                    };
+                    send(Ext::PinchBegin(sid));
+                    for i in 1..=20 {
+                        std::thread::sleep(Duration::from_millis(30));
+                        send(Ext::PinchUpdate(1.0 + (to - 1.0) * i as f64 / 20.0));
+                    }
+                    std::thread::sleep(Duration::from_millis(600));
+                    send(Ext::PinchEnd);
+                });
+            }
             Ext::Exec(line) => match keys::parse(&line) {
                 Ok(c) => self.exec(c, None, el),
                 Err(e) => self.err(e),
@@ -1087,6 +1122,29 @@ impl App {
             }
             Ext::Open(p) => self.exec(Command::Open(p.to_string_lossy().into_owned()), None, el),
             Ext::Synctex { input, line, column } => self.synctex_view(&input, line, column),
+            Ext::PinchBegin(surface) => {
+                let float = self.float.as_ref().is_some_and(|f| f.sid == surface);
+                let base = if float { self.float.as_ref().map_or(1.0, |f| f.zoom) } else { self.zoom };
+                self.pinch = Some((base, float));
+            }
+            Ext::PinchUpdate(scale) => {
+                if let Some((base, float)) = self.pinch {
+                    let z = base * scale as f32;
+                    if float {
+                        self.in_float_view(|a| {
+                            a.float_fit_off();
+                            a.pinch_zoom(z);
+                        });
+                    } else {
+                        self.pinch_zoom(z);
+                    }
+                }
+            }
+            Ext::PinchEnd => {
+                self.pinch = None;
+                self.zoom_hold = false;
+                self.zoom_settle = None;
+            }
         }
         self.redraw();
     }
@@ -1126,6 +1184,31 @@ impl App {
         self.sy = cy - vh / 2.0;
         self.clamp_scroll();
         self.invalidate(false);
+    }
+
+    /// Zoom keeping the point under the pointer fixed.
+    fn zoom_at(&mut self, z: f32, mx: f32, my: f32) {
+        let z = z.clamp(MIN_ZOOM, MAX_ZOOM);
+        if (z - self.zoom).abs() < 1e-6 {
+            return;
+        }
+        let s = self.scale();
+        let (px, py) = (self.x0() + mx / s, self.sy + my / s);
+        self.zoom = z;
+        let s2 = self.scale();
+        self.sx = px - mx / s2;
+        self.sy = py - my / s2;
+        self.clamp_scroll();
+        self.invalidate(false);
+    }
+
+    /// A continuous zoom step (pinch, Ctrl+wheel): scaled cached tiles only until it pauses.
+    fn pinch_zoom(&mut self, z: f32) {
+        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        self.zoom_hold = true;
+        self.zoom_settle = Some(Instant::now() + Duration::from_millis(180));
+        self.zoom_at(z, mx, my);
+        self.redraw();
     }
 
     fn zoom_factor(&self, n: i32) -> f32 {
@@ -2009,7 +2092,7 @@ impl App {
         self.sync_wanted();
         let gen = self.render.gen.load(Ordering::Relaxed);
         let recolor = self.applied.recolor.with_enabled(self.cfg.recolor.enabled);
-        for k in &wanted {
+        for k in wanted.iter().filter(|_| !self.zoom_hold) {
             if !self.cache.contains(k) && self.pending.insert(*k) {
                 let _ = self.render.req_tx.send(Cmd::Tile(Request { key: *k, gen, recolor }));
             }
@@ -2279,6 +2362,8 @@ impl ApplicationHandler<()> for App {
         self.dpi = window.scale_factor() as f32;
         let sz = window.inner_size();
         self.vp = (sz.width, sz.height);
+        self.main_sid = surface_id(&*window);
+        crate::pinch::spawn(&*window, self.ext_tx.clone(), self.proxy.clone());
         self.window = Some(window);
         self.applied.font.1 = 0.0; // re-apply font size at the real dpi
         self.apply_config();
@@ -2298,14 +2383,26 @@ impl ApplicationHandler<()> for App {
 
     /// The only timer in the program: armed while a hover is pending, otherwise `Wait`.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        match self.hover.poll(Instant::now()) {
+        let now = Instant::now();
+        let mut until = None;
+        // a zoom gesture that paused: now render the tiles for the new scale
+        if let Some(d) = self.zoom_settle {
+            if now >= d {
+                self.zoom_settle = None;
+                self.zoom_hold = false;
+                self.redraw_all();
+            } else {
+                until = Some(d);
+            }
+        }
+        match self.hover.poll(now) {
             popup::Poll::Fire => {
                 self.hover_fire();
-                el.set_control_flow(ControlFlow::Wait);
             }
-            popup::Poll::Wait(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
-            popup::Poll::Idle => el.set_control_flow(ControlFlow::Wait),
+            popup::Poll::Wait(d) => until = Some(until.map_or(d, |u: Instant| u.min(d))),
+            popup::Poll::Idle => {}
         }
+        el.set_control_flow(until.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
@@ -2467,7 +2564,7 @@ impl ApplicationHandler<()> for App {
                     _ if self.mode == Mode::Index => {
                         if dy > 0.0 { self.index.up((dy * 3.0) as usize) } else { self.index.down((-dy * 3.0) as usize) }
                     }
-                    _ if self.mods.control_key() => self.set_zoom(self.zoom * self.zoom_factor(1).powf(dy)),
+                    _ if self.mods.control_key() => self.pinch_zoom(self.zoom * self.zoom_factor(1).powf(dy)),
                     _ => self.scroll_by(-dx * WHEEL_PX * self.dpi, -dy * WHEEL_PX * self.dpi),
                 }
                 self.redraw();
@@ -2489,5 +2586,13 @@ fn ago(t: i64) -> String {
         60..=3599 => format!("{} min ago", d / 60),
         3600..=86399 => format!("{} h ago", d / 3600),
         _ => format!("{} d ago", d / 86400),
+    }
+}
+
+/// The wl_surface pointer of a window, as pinch events identify surfaces (0 when not Wayland).
+fn surface_id(w: &impl raw_window_handle::HasWindowHandle) -> usize {
+    match w.window_handle().map(|h| h.as_raw()) {
+        Ok(raw_window_handle::RawWindowHandle::Wayland(h)) => h.surface.as_ptr() as usize,
+        _ => 0,
     }
 }

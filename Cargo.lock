@@ -1473,11 +1473,15 @@ dependencies = [
  "libc",
  "mupdf",
  "mupdf-sys",
+ "raw-window-handle",
  "rusqlite",
  "serde",
  "serde_json",
  "signal-hook",
  "softbuffer",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "winit",
 ]
 

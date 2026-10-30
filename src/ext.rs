@@ -26,6 +26,10 @@ pub enum Ext {
     Goto(u32),
     Synctex { input: String, line: u32, column: u32 },
     Open(PathBuf),
+    /// Touchpad pinch: begin (with the wl_surface pointer), cumulative scale, end.
+    PinchBegin(usize),
+    PinchUpdate(f64),
+    PinchEnd,
 }
 
 /// What the D-Bus properties report; updated by the app when the page or file changes.

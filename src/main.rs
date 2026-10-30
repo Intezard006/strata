@@ -10,6 +10,7 @@ mod keys;
 mod layout;
 mod links;
 mod pages;
+mod pinch;
 mod previews;
 mod pstore;
 mod recolor;
