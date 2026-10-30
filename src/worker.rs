@@ -54,9 +54,15 @@ impl Job {
             };
             cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
             // own process group: cancelling kills ocrmypdf and its workers too
+            // and die with the viewer (SIGTERM; the child's handler then kills its group)
+            let parent = unsafe { libc::getpid() };
             unsafe {
-                cmd.pre_exec(|| {
+                cmd.pre_exec(move || {
                     libc::setsid();
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+                    if libc::getppid() != parent {
+                        libc::_exit(0); // the viewer is already gone
+                    }
                     Ok(())
                 });
             }

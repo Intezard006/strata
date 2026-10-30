@@ -8,6 +8,7 @@ set recolor-darkcolor    "#ffffff"
 set recolor-keephue      false
 
 set cache-mb             64
+set cache-max-mb         2048     # on-disk analysis/OCR cache cap (LRU)
 set scroll-step          40
 set zoom-step            10
 set page-gap             8

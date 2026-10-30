@@ -6,10 +6,12 @@ mod heading;
 mod keys;
 mod layout;
 mod links;
+mod pages;
 mod recolor;
 mod render;
 mod search;
 mod text;
+mod toc;
 mod ui;
 mod worker;
 

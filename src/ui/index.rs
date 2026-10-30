@@ -107,16 +107,16 @@ impl Index {
     }
 }
 
-pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, auto: bool, bottom_reserved: i32) -> usize {
+pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, auto: Option<&str>, bottom_reserved: i32) -> usize {
     cv.fill_rect(0, 0, cv.w, cv.h - bottom_reserved, panel_bg());
     let (lh, cw) = (t.line_h, t.width("M").max(1));
     let pad = cw * 2;
-    let title = format!("Index{}  (j/k move, l/h expand/collapse, Enter jump, Tab close)", if auto { " (auto)" } else { "" });
+    let title = format!("Index{}  (j/k move, l/h expand/collapse, Enter jump, Tab close)", auto.map_or(String::new(), |l| format!(" ({l})")));
     t.draw(cv, pad, 6, &title, ACCENT, cv.w - 2 * pad);
     let top = lh + 14;
     let rows = ((cv.h - bottom_reserved - top - 6) / lh).max(1) as usize;
     if ix.items.is_empty() {
-        t.draw(cv, pad, top, "No index (auto-index arrives in phase 3)", DIM, cv.w - 2 * pad);
+        t.draw(cv, pad, top, "No index (:reindex builds one)", DIM, cv.w - 2 * pad);
         return rows;
     }
     ix.keep_visible(rows);

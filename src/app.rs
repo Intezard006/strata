@@ -119,7 +119,7 @@ pub struct App {
     job_status: Option<String>,
     outline_items: Vec<Item>,
     auto_items: Vec<Item>,
-    index_auto: bool,
+    index_auto: Option<&'static str>,
     analysis: Option<Analysis>,
 }
 
@@ -180,7 +180,7 @@ impl App {
             job_status: None,
             outline_items: Vec::new(),
             auto_items: Vec::new(),
-            index_auto: false,
+            index_auto: None,
             analysis: None,
         };
         app.load_config();
@@ -278,7 +278,8 @@ impl App {
                 AutoIndex::Always => true,
                 AutoIndex::Auto => self.outline_items.is_empty(),
             };
-        self.index_auto = auto;
+        let from_contents = self.analysis.as_ref().is_some_and(|a| a.index_source == cache::IndexSource::Contents);
+        self.index_auto = auto.then_some(if from_contents { "contents" } else { "auto" });
         self.index = Index::new(if auto { self.auto_items.clone() } else { self.outline_items.clone() });
     }
 
@@ -301,11 +302,15 @@ impl App {
             return;
         }
         let file = self.path.display().to_string();
-        let mut args = vec!["--analyze", file.as_str()];
+        let cap = self.cfg.cache_max_mb.to_string();
+        let mut args = vec!["--analyze", file.as_str(), "--cache-max-mb", cap.as_str()];
         if force_ocr {
             args.push("--ocr");
         } else if !self.cfg.auto_ocr {
             args.push("--no-ocr");
+        }
+        if recompute {
+            args.push("--force");
         }
         self.spawn_job(&args, JobKind::Analyze);
     }

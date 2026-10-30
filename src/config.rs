@@ -6,6 +6,7 @@ use crate::recolor::Recolor;
 
 pub struct Config {
     pub cache_mb: usize,
+    pub cache_max_mb: u64,
     pub default_bg: [u8; 4],
     pub recolor: Recolor,
     pub scroll_step: f32,
@@ -31,6 +32,7 @@ pub enum AutoIndex {
 /// (name, description) for `:set` completion and the help overlay.
 pub const OPTIONS: &[(&str, &str)] = &[
     ("cache-mb", "Rendered page cache size in MB"),
+    ("cache-max-mb", "Cap for the on-disk analysis/OCR cache in MB (LRU eviction)"),
     ("default-bg", "Window background colour (#rrggbb, #rrggbbaa, rgba(r,g,b,a))"),
     ("recolor", "Recolor pages (true/false)"),
     ("recolor-lightcolor", "Paper colour; same RGB as default-bg keeps pages transparent"),
@@ -52,6 +54,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             cache_mb: 64,
+            cache_max_mb: 2048,
             default_bg: [0x1e, 0x1e, 0x2e, 0x99],
             recolor: Recolor { light: [0x1e, 0x1e, 0x2e, 0xff], ..Recolor::default() },
             scroll_step: 40.0,
@@ -126,6 +129,7 @@ impl Config {
     pub fn set(&mut self, name: &str, v: &str) -> Result<(), String> {
         match name {
             "cache-mb" => self.cache_mb = parse_num(v, 1.0, 4096.0)? as usize,
+            "cache-max-mb" => self.cache_max_mb = parse_num(v, 16.0, 1_000_000.0)? as u64,
             "default-bg" => self.default_bg = parse_color(v)?,
             "recolor" => self.recolor.enabled = parse_bool(v)?,
             "recolor-lightcolor" => self.recolor.light = parse_color(v)?,
@@ -159,6 +163,7 @@ impl Config {
     pub fn get(&self, name: &str) -> Option<String> {
         Some(match name {
             "cache-mb" => self.cache_mb.to_string(),
+            "cache-max-mb" => self.cache_max_mb.to_string(),
             "default-bg" => fmt_color(self.default_bg),
             "recolor" => self.recolor.enabled.to_string(),
             "recolor-lightcolor" => fmt_color(self.recolor.light),

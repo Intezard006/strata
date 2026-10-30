@@ -226,13 +226,13 @@ mod tests {
 
     #[test]
     fn completion() {
-        let (s, c) = completions("set cac");
+        let (s, c) = completions("set cache-mb");
         assert_eq!((s, c), (4, vec!["cache-mb".to_string()]));
         let (_, c) = completions("sear");
         assert!(c.contains(&"search".to_string()) && c.contains(&"search-next".to_string()));
-        let mut b = typed("set cac");
+        let mut b = typed("set cache-ma");
         b.tab();
-        assert_eq!(b.string(), "set cache-mb ");
+        assert_eq!(b.string(), "set cache-max-mb ");
         let mut b = typed("search-");
         b.tab();
         let first = b.string();

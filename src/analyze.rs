@@ -13,8 +13,10 @@ use std::process::{Command, ExitCode, Stdio};
 
 use mupdf::{Document, TextBlockContent, TextCharFlags, TextPageFlags};
 
-use crate::cache::{self, Analysis, IndexEntry, OcrState};
+use crate::cache::{self, Analysis, IndexEntry, IndexSource, OcrState};
 use crate::heading::{self, size_key, Line};
+use crate::pages::{self, Cand};
+use crate::toc;
 use crate::render::open_doc;
 
 const TEXT_MIN_CHARS: usize = 20;
@@ -46,6 +48,8 @@ struct PageInfo {
     /// Short lines only (headings are short); this is what the index pass keeps.
     short: Vec<Line>,
     hist: Vec<(u32, u64)>,
+    /// Page-number candidates from the first and last two lines.
+    edge: Vec<Cand>,
 }
 
 fn analyze_page(doc: &Document, p: usize) -> Option<PageInfo> {
@@ -72,7 +76,7 @@ fn analyze_page(doc: &Document, p: usize) -> Option<PageInfo> {
             chars += n;
             let size_k = sizes.iter().max_by_key(|(_, &c)| c).map(|(&k, _)| k).unwrap_or(0);
             *hist.entry(size_k).or_default() += n as u64;
-            let text = l.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let text = toc::squash_leaders(&l.text.split_whitespace().collect::<Vec<_>>().join(" "));
             raw.push(RawLine {
                 text,
                 size: size_k as f32 / 2.0,
@@ -84,6 +88,13 @@ fn analyze_page(doc: &Document, p: usize) -> Option<PageInfo> {
             });
         }
     }
+    let edge = {
+        let mut order: Vec<&RawLine> = raw.iter().collect();
+        order.sort_by(|a, b| a.y0.total_cmp(&b.y0));
+        let k = order.len();
+        let pick: Vec<&str> = order.iter().enumerate().filter(|(i, _)| *i < 2 || *i + 2 >= k).map(|(_, l)| l.text.as_str()).collect();
+        pages::candidates(&pick)
+    };
     let mut short = Vec::new();
     for (i, l) in raw.iter().enumerate() {
         if l.text.split(' ').count() > 14 || l.text.len() > 140 {
@@ -102,6 +113,7 @@ fn analyze_page(doc: &Document, p: usize) -> Option<PageInfo> {
         }
         short.push(Line {
             page: p as u32,
+            x0: l.x0,
             text: l.text.clone(),
             size: l.size,
             bold: l.bold,
@@ -111,7 +123,7 @@ fn analyze_page(doc: &Document, p: usize) -> Option<PageInfo> {
             gap_below: below,
         });
     }
-    Some(PageInfo { chars, short, hist: hist.into_iter().collect() })
+    Some(PageInfo { chars, short, hist: hist.into_iter().collect(), edge })
 }
 
 /// Scanned = most of ~10 evenly spread pages have (almost) no text.
@@ -166,14 +178,35 @@ fn run_ocr(src: &Path, dir: &Path) -> Result<(), String> {
     std::fs::rename(&tmp, &out).map_err(|e| e.to_string())
 }
 
+/// SIGTERM (the viewer died, or cancelled us): take ocrmypdf and its workers down with us.
+/// Only when we lead our own process group, i.e. were started by the viewer.
+static GROUP_LEADER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_term(_: libc::c_int) {
+    unsafe {
+        if GROUP_LEADER.load(std::sync::atomic::Ordering::Relaxed) {
+            libc::kill(0, libc::SIGKILL);
+        }
+        libc::_exit(143);
+    }
+}
+
+fn install_term_handler() {
+    unsafe {
+        GROUP_LEADER.store(libc::getpgrp() == libc::getpid(), std::sync::atomic::Ordering::Relaxed);
+        libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    }
+}
+
 pub fn run(args: &[String]) -> ExitCode {
     let Some(file) = args.first().map(PathBuf::from) else {
-        eprintln!("usage: strata --analyze <file> [--ocr] [--no-ocr]");
+        eprintln!("usage: strata --analyze <file> [--ocr] [--no-ocr] [--force] [--cache-max-mb N]");
         return ExitCode::from(2);
     };
-    let force_ocr = args.iter().any(|a| a == "--ocr");
-    let no_ocr = args.iter().any(|a| a == "--no-ocr");
-    match analyze(&file, force_ocr, no_ocr) {
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let cap_mb: u64 = args.iter().position(|a| a == "--cache-max-mb").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(2048);
+    install_term_handler();
+    match analyze(&file, flag("--ocr"), flag("--no-ocr"), flag("--force"), cap_mb) {
         Ok(()) => {
             say("D");
             ExitCode::SUCCESS
@@ -185,9 +218,16 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
-fn analyze(file: &Path, force_ocr: bool, no_ocr: bool) -> Result<(), String> {
+fn analyze(file: &Path, force_ocr: bool, no_ocr: bool, force: bool, cap_mb: u64) -> Result<(), String> {
     let dir = cache::dir_for(file).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    cache::touch(&dir);
+    cache::evict(&cache::cache_root(), &dir, cap_mb.saturating_mul(1 << 20));
+    // one analysis per document: a second viewer blocks here (no polling) until the first is done
+    let _lock = cache::lock(&dir, || say("S waiting for another strata instance...")).map_err(|e| format!("lock: {e}"))?;
+    if !force && !force_ocr && cache::load(&dir).is_some() {
+        return Ok(());
+    }
     let orig = open_doc(&file.to_path_buf())?;
     let n = orig.page_count().map_err(|e| e.to_string())? as usize;
     let scanned = detect_scanned(&orig, n);
@@ -226,6 +266,7 @@ fn analyze(file: &Path, force_ocr: bool, no_ocr: bool) -> Result<(), String> {
     let mut has_text = Vec::with_capacity(n);
     let mut lines: Vec<Line> = Vec::new();
     let mut hist: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut edges: Vec<Vec<Cand>> = Vec::with_capacity(n);
     for p in 0..n {
         if p > 0 && p % REOPEN_EVERY == 0 {
             // MuPDF keeps every touched page's objects; reopening bounds the child's peak memory
@@ -239,17 +280,47 @@ fn analyze(file: &Path, force_ocr: bool, no_ocr: bool) -> Result<(), String> {
         match analyze_page(&doc, p) {
             Some(info) => {
                 has_text.push(info.chars >= TEXT_MIN_CHARS);
+                edges.push(info.edge);
                 lines.extend(info.short);
                 for (k, c) in info.hist {
                     *hist.entry(k).or_default() += c;
                 }
             }
-            None => has_text.push(false),
+            None => {
+                has_text.push(false);
+                edges.push(Vec::new());
+            }
         }
     }
-    let index = heading::build_index(&lines, heading::body_size(&hist), n);
-    let a = Analysis { version: cache::VERSION, pages: n as u32, has_text, scanned, ocr, index, extras: Default::default() };
+    let page_map = pages::detect(&edges);
+    let (index, index_source) = build_index(&lines, n, heading::body_size(&hist), &page_map);
+    let a = Analysis { version: cache::VERSION, pages: n as u32, has_text, scanned, ocr, index, index_source, page_map, extras: Default::default() };
     cache::save(&dir, &a).map_err(|e| e.to_string())
+}
+
+/// The book's own contents when it has one that resolves, else heading heuristics.
+fn build_index(lines: &[Line], n: usize, body: f32, map: &pages::PageMap) -> (Vec<IndexEntry>, IndexSource) {
+    let det = toc::detect(lines, n);
+    let debug = std::env::var_os("STRATA_DEBUG").is_some();
+    if debug {
+        eprintln!("contents pages {:?}, {} raw entries", det.pages, det.raw.len());
+    }
+    if det.raw.len() >= 5 {
+        let r = toc::resolve(&det, lines, n, map);
+        if debug {
+            eprintln!("resolved {} located {}", r.entries.len(), r.located);
+        }
+        // a ToC whose titles mostly cannot be found on their pages points at a wrong offset
+        if r.entries.len() >= 5 && r.located * 5 >= r.entries.len() {
+            return (r.entries, IndexSource::Contents);
+        }
+    }
+    let mut skip = heading::index_pages(lines, n);
+    for &p in &det.pages {
+        skip[p as usize] = true;
+    }
+    let start = det.pages.first().copied();
+    (heading::build_index(lines, body, n, &skip, start), IndexSource::Heuristic)
 }
 
 /// `strata --dump-lines <file> [first] [last]`: developer aid showing the heading metrics.
