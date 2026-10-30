@@ -109,7 +109,7 @@ pub const OPTIONS: &[(&str, &str)] = &[
 impl Default for Config {
     fn default() -> Self {
         Config {
-            cache_mb: 64,
+            cache_mb: 40,
             cache_max_mb: 2048,
             default_bg: [0x1e, 0x1e, 0x2e, 0x99],
             recolor: Recolor { light: [0x1e, 0x1e, 0x2e, 0xff], ..Recolor::default() },

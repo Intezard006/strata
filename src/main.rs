@@ -28,6 +28,16 @@ use std::process::ExitCode;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> ExitCode {
+    // Fixed malloc thresholds: big pixmaps are mmapped and returned at once instead of
+    // fragmenting the render thread's arena; few arenas keep freed memory reusable.
+    extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    unsafe {
+        mallopt(-8, 2); // M_ARENA_MAX
+        mallopt(-3, 256 * 1024); // M_MMAP_THRESHOLD (also disables the dynamic raise)
+        mallopt(-1, 512 * 1024); // M_TRIM_THRESHOLD
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         Some("--analyze") => return analyze::run(&argv[1..]),

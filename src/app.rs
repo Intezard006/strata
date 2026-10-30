@@ -1094,6 +1094,21 @@ impl App {
     fn on_ext(&mut self, e: Ext, el: &ActiveEventLoop) {
         match e {
             Ext::Signal => el.exit(),
+            Ext::Exec(line) if debug() && line.starts_with("debug-mem") => {
+                extern "C" {
+                    fn malloc_info(o: i32, f: *mut std::ffi::c_void) -> i32;
+                    fn fopen(p: *const std::os::raw::c_char, m: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+                    fn fclose(f: *mut std::ffi::c_void) -> i32;
+                }
+                eprintln!("debug-mem: tile cache {} bytes in {} tiles", self.cache.bytes(), self.cache.len());
+                unsafe {
+                    let f = fopen(c"/tmp/claude-1000/mallinfo.xml".as_ptr(), c"w".as_ptr());
+                    if !f.is_null() {
+                        malloc_info(0, f);
+                        fclose(f);
+                    }
+                }
+            }
             Ext::Exec(line) if debug() && line.starts_with("debug-pinch") => {
                 // developer aid: a synthetic pinch of 20 steps from 1.0 to the given scale
                 let to: f64 = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(2.0);

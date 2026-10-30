@@ -16,9 +16,6 @@ use winit::event_loop::EventLoopProxy;
 use crate::layout::{page_px, tile_grid};
 use crate::recolor::{ImgRect, Recolor, DARK_MEAN};
 
-/// Shrink MuPDF's internal store to this fraction (percent) after each render.
-const STORE_SHRINK_PERCENT: u32 = 10;
-
 /// `scale` is px-per-point in thousandths, so keys hash exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileKey {
@@ -59,12 +56,10 @@ impl TileCache {
         TileCache { map: HashMap::new(), bytes: 0, cap, tick: 0 }
     }
 
-    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -316,9 +311,17 @@ struct Renderer {
 }
 
 impl Renderer {
+    /// Empty MuPDF's store (decoded images, glyphs): it is only worth keeping while more
+    /// tiles of the same page are still queued, so the decoded page image is used once.
     fn shrink_store(&self) {
         if let Some(c) = self.ctx {
-            unsafe { mupdf_sys::fz_shrink_store(c, STORE_SHRINK_PERCENT) };
+            unsafe { mupdf_sys::fz_empty_store(c) };
+        }
+    }
+
+    fn release_store(&self, page: u32) {
+        if !self.queue.iter().any(|r| r.key.page == page) {
+            self.shrink_store();
         }
     }
 
@@ -512,7 +515,7 @@ impl Renderer {
                 render_tile(page, b.x0, b.y0, self.sizes[k.page as usize], k, &req.recolor, &imgs, &self.cs)
             })
             .unwrap_or(Tile { w: 0, h: 0, data: Vec::new() });
-        self.shrink_store();
+        self.release_store(k.page);
         self.send(Response::Tile { key: k, gen: req.gen, tile });
     }
 
