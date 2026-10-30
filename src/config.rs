@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::recolor::{ImageMode, Recolor};
 
+#[derive(Clone)]
 pub struct Config {
     pub cache_mb: usize,
     pub cache_max_mb: u64,
@@ -25,8 +26,41 @@ pub struct Config {
     pub preview_max_scale: f32,
     pub restore_position: bool,
     pub goto_printed: bool,
+    pub float_width: u32,
+    pub float_height: u32,
+    pub float_position: String,
     pub synctex: bool,
     pub synctex_editor_command: String,
+}
+
+/// A look profile: option overrides applied on top of the base config.
+pub struct Profile {
+    pub name: String,
+    pub opts: Vec<(String, String)>,
+}
+
+/// The profiles used when the config defines none: the old zathura `normal` and `textbook` looks.
+pub fn builtin_profiles() -> Vec<Profile> {
+    let p = |name: &str, o: &[(&str, &str)]| Profile { name: name.into(), opts: o.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect() };
+    vec![
+        p("normal", &[("recolor-lightcolor", "#1e1e2e"), ("recolor-darkcolor", "#ffffff"), ("default-bg", "#1e1e2e99"), ("recolor-keephue", "true")]),
+        p("textbook", &[("recolor-lightcolor", "rgba(0,0,0,0)"), ("recolor-darkcolor", "rgba(255,255,255,1)"), ("default-bg", "rgba(0,0,0,0)"), ("recolor-keephue", "false")]),
+    ]
+}
+
+/// Apply profile `name`: every option some profile touches first returns to its `base` value, then the
+/// profile's own values are set. `None` when there is no such profile; otherwise the errors met.
+pub fn apply_profile(profiles: &[Profile], name: &str, base: &Config, cfg: &mut Config) -> Option<Vec<String>> {
+    let p = profiles.iter().find(|p| p.name == name)?;
+    let mut touched: Vec<&str> = profiles.iter().flat_map(|q| q.opts.iter().map(|o| o.0.as_str())).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    for o in touched {
+        if let Some(v) = base.get(o) {
+            let _ = cfg.set(o, &v);
+        }
+    }
+    Some(p.opts.iter().filter_map(|(o, v)| cfg.set(o, v).err()).collect())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +97,9 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("preview-max-scale", "Maximum render scale of the popup (1 = 100%)"),
     ("restore-position", "Reopen documents at the last position, zoom and recolor state (true/false)"),
     ("goto-printed", "`:goto N` and `NG` use printed page numbers when the book has them (true/false)"),
+    ("float-width", "Float window width in logical pixels"),
+    ("float-height", "Float window height in logical pixels"),
+    ("float-position", "Float window position: top-right, top-left, bottom-right, bottom-left, center"),
     ("synctex", "SyncTeX forward/backward search (true/false)"),
     ("synctex-editor-command", "Run on Ctrl+click; %{input} %{line} %{column} are substituted (quote the value)"),
 ];
@@ -89,6 +126,9 @@ impl Default for Config {
             preview_max_scale: 3.0,
             restore_position: true,
             goto_printed: true,
+            float_width: 520,
+            float_height: 700,
+            float_position: "top-right".into(),
             synctex: true,
             synctex_editor_command: String::new(),
         }
@@ -186,6 +226,14 @@ impl Config {
             "preview-max-scale" => self.preview_max_scale = parse_num(v, 0.5, 8.0)?,
             "restore-position" => self.restore_position = parse_bool(v)?,
             "goto-printed" => self.goto_printed = parse_bool(v)?,
+            "float-width" => self.float_width = parse_num(v, 200.0, 4000.0)? as u32,
+            "float-height" => self.float_height = parse_num(v, 150.0, 4000.0)? as u32,
+            "float-position" => {
+                if !["top-right", "top-left", "bottom-right", "bottom-left", "center"].contains(&v) {
+                    return Err(format!("float-position: expected top-right|top-left|bottom-right|bottom-left|center, got {v}"));
+                }
+                self.float_position = v.to_string();
+            }
             "synctex" => self.synctex = parse_bool(v)?,
             "synctex-editor-command" => self.synctex_editor_command = v.to_string(),
             "auto-index" => {
@@ -227,6 +275,9 @@ impl Config {
             "preview-max-scale" => self.preview_max_scale.to_string(),
             "restore-position" => self.restore_position.to_string(),
             "goto-printed" => self.goto_printed.to_string(),
+            "float-width" => self.float_width.to_string(),
+            "float-height" => self.float_height.to_string(),
+            "float-position" => self.float_position.clone(),
             "synctex" => self.synctex.to_string(),
             "synctex-editor-command" => self.synctex_editor_command.clone(),
             "auto-index" => format!("{:?}", self.auto_index).to_lowercase(),
@@ -392,5 +443,39 @@ mod tests {
         let mut c = c;
         c.set("recolor-lightcolor", "#ffffff").unwrap();
         assert_eq!(c.effective_recolor().light[3], 255);
+    }
+
+    #[test]
+    fn profiles_restore_base_for_unset_options() {
+        let base = Config::default();
+        let profs = vec![
+            Profile { name: "a".into(), opts: vec![("recolor-keephue".into(), "true".into()), ("default-bg".into(), "#112233".into())] },
+            Profile { name: "b".into(), opts: vec![("recolor-darkcolor".into(), "#010203".into())] },
+        ];
+        let mut c = base.clone();
+        assert_eq!(apply_profile(&profs, "a", &base, &mut c), Some(vec![]));
+        assert!(c.recolor.keephue);
+        assert_eq!(c.default_bg[..3], [0x11, 0x22, 0x33]);
+        assert_eq!(apply_profile(&profs, "b", &base, &mut c), Some(vec![]));
+        assert!(!c.recolor.keephue, "back to the base value");
+        assert_eq!(c.default_bg, base.default_bg);
+        assert_eq!(c.recolor.dark, [1, 2, 3]);
+        assert!(apply_profile(&profs, "zzz", &base, &mut c).is_none());
+        let bad = vec![Profile { name: "x".into(), opts: vec![("nope".into(), "1".into())] }];
+        assert_eq!(apply_profile(&bad, "x", &base, &mut c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn builtin_profiles_apply() {
+        let base = Config::default();
+        let profs = builtin_profiles();
+        let mut c = base.clone();
+        assert_eq!(apply_profile(&profs, "textbook", &base, &mut c), Some(vec![]));
+        assert_eq!(c.default_bg, [0, 0, 0, 0]);
+        assert_eq!(c.recolor.dark, [255, 255, 255]);
+        assert!(!c.recolor.keephue);
+        assert_eq!(apply_profile(&profs, "normal", &base, &mut c), Some(vec![]));
+        assert!(c.recolor.keephue);
+        assert_eq!(c.default_bg, [0x1e, 0x1e, 0x2e, 0x99]);
     }
 }

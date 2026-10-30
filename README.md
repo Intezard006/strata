@@ -14,6 +14,13 @@ Quick tour: `j k` scroll, `Space`/`J` next page, `gg G` first/last, `Tab` index,
 hints, `gp` list of equations/theorems/figures, `/` search, `m a` set mark, `' a` jump to it (`A`-`Z` are global
 and reopen their file), `:bmark NAME`, `gb`/`:blist` bookmarks, `:recent` recent files.
 
+`Ctrl-p` opens a command palette over commands, index entries, bookmarks, previews and recent files (prefix `>`
+commands, `#` index, `@` bookmarks, `=` previews, `%` recent). `:goto 120` goes to printed page 120 when the book has
+page numbers, `:goto #120` to PDF page 120, `:goto xii` to front matter. `Ctrl-t` cycles look profiles (`normal`,
+`textbook`, or your own `profile NAME OPTION VALUE` lines). `gf` opens a small floating, pinned window with the current
+page (or the preview target) inside the same process; `strata --float FILE --page N` does the same from a script.
+Images keep their colours in recolor mode (`set recolor-images keep|dim|recolor`).
+
 State (last position, zoom, recolor, bookmarks, marks, jumplist) is stored in `~/.local/share/strata/strata.db` and
 written on close, focus loss, `:open` and SIGTERM/SIGINT; `set restore-position false` turns restoring off.
 

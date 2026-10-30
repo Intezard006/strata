@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS marks(
   PRIMARY KEY(key, ch));
 CREATE TABLE IF NOT EXISTS gmarks(
   ch TEXT PRIMARY KEY, key TEXT NOT NULL, path TEXT NOT NULL, page INTEGER NOT NULL, y REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS jumps(
   key TEXT PRIMARY KEY, pos INTEGER NOT NULL, list TEXT NOT NULL);
 ";
@@ -142,6 +143,15 @@ impl Db {
         self.conn.prepare_cached("SELECT key,path,page,y FROM gmarks WHERE ch=?1").ok()?.query_row([ch.to_string()], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?), r.get(2)?, r.get(3)?))).optional().ok().flatten()
     }
 
+    /// Global (not per-document) settings such as the active look profile.
+    pub fn set_kv(&self, k: &str, v: &str) {
+        let _ = self.conn.prepare_cached("INSERT OR REPLACE INTO kv(k,v) VALUES(?1,?2)").and_then(|mut s| s.execute(params![k, v]));
+    }
+
+    pub fn kv(&self, k: &str) -> Option<String> {
+        self.conn.prepare_cached("SELECT v FROM kv WHERE k=?1").ok()?.query_row([k], |r| r.get(0)).optional().ok().flatten()
+    }
+
     pub fn save_jumps(&self, key: &str, pos: usize, list: &[f32]) {
         let list = &list[list.len().saturating_sub(JUMPS_MAX)..];
         let text: Vec<String> = list.iter().map(|v| v.to_string()).collect();
@@ -195,6 +205,15 @@ mod tests {
         db.set_gmark('A', "k", Path::new("/a.pdf"), 9, 2.0);
         assert_eq!(db.gmark('A'), Some(("k".into(), PathBuf::from("/a.pdf"), 9, 2.0)));
         assert_eq!(db.gmark('B'), None);
+    }
+
+    #[test]
+    fn global_settings() {
+        let db = Db::memory();
+        assert_eq!(db.kv("profile"), None);
+        db.set_kv("profile", "textbook");
+        db.set_kv("profile", "normal");
+        assert_eq!(db.kv("profile").as_deref(), Some("normal"));
     }
 
     #[test]

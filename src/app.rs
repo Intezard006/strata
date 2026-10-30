@@ -79,6 +79,32 @@ struct Hints {
     items: Vec<HintItem>,
 }
 
+/// Everything that differs between the main window and the float window. The float window shares
+/// the document, renderer, tile cache and config; its view state is swapped in while it is handled.
+struct View {
+    window: Option<Arc<Window>>,
+    surface: Option<Surface<Arc<Window>, Arc<Window>>>,
+    zoom: f32,
+    sx: f32,
+    sy: f32,
+    vp: (u32, u32),
+    dpi: f32,
+    cursor: (f64, f64),
+    pending: HashSet<TileKey>,
+    title_page: usize,
+    /// Keep fitting the page (or region) to the window width until the user zooms.
+    fit: bool,
+    /// Target region (page, rect in points) the float was opened on.
+    region: Option<(usize, [f32; 4])>,
+}
+
+pub struct StartOpts {
+    pub synctex: Option<(String, u32, u32)>,
+    /// `--float`: the only window is a float window.
+    pub float: bool,
+    pub page: Option<u32>,
+}
+
 struct Placed {
     key: TileKey,
     x: i64,
@@ -163,6 +189,21 @@ pub struct App {
     flash: Option<(u32, [f32; 4])>,
     /// A forward search to run once the window is up (`--synctex-forward` on a fresh start).
     start_synctex: Option<(String, u32, u32)>,
+    float: Option<View>,
+    float_fit: bool,
+    float_target: Option<(usize, Option<[f32; 4]>)>,
+    /// True while the float window's view is swapped in.
+    in_float: bool,
+    float_close: bool,
+    float_placed: bool,
+    /// The only window is a float window (`--float`).
+    float_solo: bool,
+    start_page: Option<u32>,
+    wanted_main: Vec<TileKey>,
+    wanted_float: Vec<TileKey>,
+    profiles: Vec<config::Profile>,
+    base: Config,
+    profile_active: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,7 +213,7 @@ enum JobKind {
 }
 
 impl App {
-    pub fn new(render: RenderHandle, sizes: Vec<(f32, f32)>, path: PathBuf, proxy: EventLoopProxy<()>, start_synctex: Option<(String, u32, u32)>) -> Self {
+    pub fn new(render: RenderHandle, sizes: Vec<(f32, f32)>, path: PathBuf, proxy: EventLoopProxy<()>, opts: StartOpts) -> Self {
         START.get_or_init(Instant::now);
         let cfg = Config::default();
         let (worker_tx, worker_rx) = channel();
@@ -247,7 +288,20 @@ impl App {
             mark_prompt: None,
             open_goto: None,
             flash: None,
-            start_synctex,
+            start_synctex: opts.synctex,
+            float: None,
+            float_fit: true,
+            float_target: None,
+            in_float: false,
+            float_close: false,
+            float_placed: false,
+            float_solo: opts.float,
+            start_page: opts.page,
+            wanted_main: Vec::new(),
+            wanted_float: Vec::new(),
+            profiles: Vec::new(),
+            base: Config::default(),
+            profile_active: None,
         };
         app.load_config();
         app.sync_info();
@@ -258,6 +312,7 @@ impl App {
 
     fn load_config(&mut self) {
         self.cfg = Config::default();
+        self.profiles.clear();
         self.keymap = Keymap::with_defaults();
         let path = config::config_path();
         let mut errors = Vec::new();
@@ -267,6 +322,16 @@ impl App {
             for (file, line, w) in items {
                 let r = match w[0].as_str() {
                     "set" | "map" | "unmap" => keys::parse_words(&w[0], &w[1..]).and_then(|c| self.apply_setting(c)),
+                    "profile" => match w.as_slice() {
+                        [_, name, opt, val] => {
+                            let mut probe = self.cfg.clone();
+                            probe.set(opt, val).map(|_| match self.profiles.iter_mut().find(|p| &p.name == name) {
+                                Some(p) => p.opts.push((opt.clone(), val.clone())),
+                                None => self.profiles.push(config::Profile { name: name.clone(), opts: vec![(opt.clone(), val.clone())] }),
+                            })
+                        }
+                        _ => Err("profile: expected NAME OPTION VALUE".into()),
+                    },
                     other => Err(format!("unknown directive: {other}")),
                 };
                 if let Err(e) = r {
@@ -274,7 +339,15 @@ impl App {
                 }
             }
         }
-        self.apply_config();
+        if self.profiles.is_empty() {
+            self.profiles = config::builtin_profiles();
+        }
+        self.base = self.cfg.clone();
+        let saved = self.profile_active.clone().or_else(|| self.db.as_ref().and_then(|d| d.kv("profile")));
+        match saved.filter(|n| self.profiles.iter().any(|p| &p.name == n)) {
+            Some(n) => self.apply_profile(&n, false),
+            None => self.apply_config(),
+        }
         if let Some(first) = errors.first() {
             let more = if errors.len() > 1 { format!(" (+{} more)", errors.len() - 1) } else { String::new() };
             self.err(format!("{first}{more}"));
@@ -486,7 +559,7 @@ impl App {
     }
 
     fn bar_h(&self) -> i32 {
-        match (&self.text, self.cfg.statusbar) {
+        match (&self.text, self.cfg.statusbar && !self.in_float && !self.float_solo) {
             (Some(t), true) => statusbar::height(t),
             _ => 0,
         }
@@ -543,7 +616,7 @@ impl App {
     /// Write the position and jumplist; called on close, focus loss, `open`, signals and exit.
     pub fn save_state(&self) {
         let (Some(db), Some(key)) = (&self.db, &self.key) else { return };
-        if self.opening.is_some() || self.window.is_none() {
+        if self.opening.is_some() || self.window.is_none() || self.float_solo {
             return;
         }
         let (page, y) = self.view_pos();
@@ -654,6 +727,252 @@ impl App {
     }
 
     /// The command palette: every item list is built here and dropped with the overlay.
+    /// Apply a look profile: options it does not set (but another profile does) return to the base config.
+    fn apply_profile(&mut self, name: &str, save: bool) {
+        let Some(errs) = config::apply_profile(&self.profiles, name, &self.base, &mut self.cfg) else { return self.err(format!("No profile '{name}'")) };
+        self.profile_active = Some(name.to_string());
+        if save {
+            if let Some(db) = &self.db {
+                db.set_kv("profile", name);
+            }
+        }
+        self.apply_config();
+        match errs.first() {
+            Some(e) => self.err(format!("profile {name}: {e}")),
+            None if save => self.msg(format!("Profile: {name}")),
+            None => {}
+        }
+        self.redraw_all();
+    }
+
+    fn cycle_profile(&mut self) {
+        let cur = self.profile_active.clone().unwrap_or_else(|| "normal".into());
+        let i = self.profiles.iter().position(|p| p.name == cur).map_or(0, |i| i + 1);
+        let next = self.profiles[i % self.profiles.len()].name.clone();
+        self.apply_profile(&next, true);
+    }
+
+    fn redraw_all(&self) {
+        self.redraw();
+        if let Some(w) = self.float.as_ref().and_then(|f| f.window.as_ref()) {
+            w.request_redraw();
+        }
+    }
+
+    // ---- float window -------------------------------------------------------------------
+
+    fn swap_view(&mut self, v: &mut View) {
+        std::mem::swap(&mut self.window, &mut v.window);
+        std::mem::swap(&mut self.surface, &mut v.surface);
+        std::mem::swap(&mut self.zoom, &mut v.zoom);
+        std::mem::swap(&mut self.sx, &mut v.sx);
+        std::mem::swap(&mut self.sy, &mut v.sy);
+        std::mem::swap(&mut self.vp, &mut v.vp);
+        std::mem::swap(&mut self.dpi, &mut v.dpi);
+        std::mem::swap(&mut self.cursor, &mut v.cursor);
+        std::mem::swap(&mut self.pending, &mut v.pending);
+        std::mem::swap(&mut self.title_page, &mut v.title_page);
+    }
+
+    /// Run `f` with the float window's view in place of the main one. Overlays, popups and the
+    /// statusbar belong to the main window and are parked meanwhile.
+    fn in_float_view<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let mut v = self.float.take()?;
+        self.swap_view(&mut v);
+        let (overlay, popup, mode) = (std::mem::replace(&mut self.overlay, Overlay::None), self.popup.take(), self.mode);
+        let (fit, region) = (v.fit, v.region);
+        self.mode = Mode::Normal;
+        self.in_float = true;
+        self.float_fit = fit;
+        let r = f(self);
+        self.in_float = false;
+        let (fit, region) = (self.float_fit, region);
+        self.overlay = overlay;
+        self.popup = popup;
+        self.mode = mode;
+        self.swap_view(&mut v);
+        v.fit = fit;
+        v.region = region;
+        self.float = Some(v);
+        Some(r)
+    }
+
+    /// Fit the page (or the region the float was opened on) to the window width.
+    fn float_refit(&mut self) {
+        let Some((p, region)) = self.float_target else { return };
+        let (vw, _) = (self.vp.0 as f32, self.vp.1 as f32);
+        match region {
+            None => {
+                self.zoom = (vw / self.layout.size(p).0 / self.dpi).clamp(MIN_ZOOM, MAX_ZOOM);
+                self.sy = self.layout.top(p);
+                self.sx = 0.0;
+            }
+            Some(r) => {
+                let w = (r[2] - r[0]).max(40.0) + 16.0;
+                self.zoom = (vw / w / self.dpi).clamp(MIN_ZOOM, 6.0);
+                self.sy = self.layout.top(p) + r[1] - 8.0;
+                self.sx = self.layout.left(p) + r[0] - 8.0;
+            }
+        }
+        self.clamp_scroll();
+    }
+
+    fn open_float(&mut self, el: &ActiveEventLoop) {
+        if self.float.is_some() {
+            return self.close_float();
+        }
+        if self.float_solo {
+            return;
+        }
+        let region = self.popup.as_ref().and_then(|p| self.pv.as_ref().map(|pv| &pv.targets[p.target as usize])).map(|t| (t.page as usize, t.rect));
+        let page = region.map_or_else(|| self.current_page(), |r| r.0);
+        let attrs = Window::default_attributes()
+            .with_title("strata-float")
+            .with_transparent(true)
+            .with_inner_size(LogicalSize::new(self.cfg.float_width as f64, self.cfg.float_height as f64))
+            .with_name("strata-float", "strata-float");
+        let Ok(window) = el.create_window(attrs) else { return self.err("Cannot create the float window".into()) };
+        let window = Arc::new(window);
+        let Ok(ctx) = Context::new(window.clone()) else { return };
+        let Ok(surface) = Surface::new(&ctx, window.clone()) else { return };
+        let sz = window.inner_size();
+        let mut v = View {
+            window: Some(window.clone()),
+            surface: Some(surface),
+            zoom: 1.0,
+            sx: 0.0,
+            sy: 0.0,
+            vp: (sz.width, sz.height),
+            dpi: window.scale_factor() as f32,
+            cursor: (0.0, 0.0),
+            pending: HashSet::new(),
+            title_page: usize::MAX,
+            fit: true,
+            region,
+        };
+        v.region = region;
+        self.float = Some(v);
+        self.float_target = Some((page, region.map(|r| r.1)));
+        self.float_placed = false;
+        self.in_float_view(|a| a.float_refit());
+        window.request_redraw();
+    }
+
+    fn close_float(&mut self) {
+        self.float = None; // drops the window
+        self.float_target = None;
+        self.wanted_float.clear();
+        self.sync_wanted();
+        self.cache.retain_scales(&[self.scale_key()]);
+        unsafe { libc::malloc_trim(0) };
+        self.redraw();
+    }
+
+    fn sync_wanted(&self) {
+        let mut w = self.wanted_main.clone();
+        w.extend(self.wanted_float.iter().copied());
+        *self.render.wanted.lock().unwrap() = w;
+    }
+
+    fn float_scale_key(&self) -> Option<u32> {
+        self.float.as_ref().map(|f| ((f.zoom * f.dpi * 1000.0).round() as u32).max(1))
+    }
+
+    /// Make the float window floating, pinned, sized and placed through Hyprland (once, after it is mapped).
+    fn place_float(&mut self) {
+        if self.float_placed {
+            return;
+        }
+        self.float_placed = true;
+        let (w, h, pos) = (self.cfg.float_width, self.cfg.float_height, self.cfg.float_position.clone());
+        std::thread::Builder::new().name("hypr".into()).stack_size(128 << 10).spawn(move || crate::hypr::place_float("strata-float", w, h, &pos)).ok();
+    }
+
+    fn float_event(&mut self, el: &ActiveEventLoop, ev: WindowEvent) {
+        match ev {
+            WindowEvent::CloseRequested => self.close_float(),
+            WindowEvent::RedrawRequested => {
+                self.in_float_view(|a| a.paint());
+                self.place_float();
+            }
+            WindowEvent::Resized(sz) => {
+                self.in_float_view(|a| {
+                    a.vp = (sz.width, sz.height);
+                    if a.float_fit {
+                        a.float_refit();
+                    }
+                    a.redraw();
+                });
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.in_float_view(|a| {
+                    a.dpi = scale_factor as f32;
+                    if a.float_fit {
+                        a.float_refit();
+                    }
+                    a.redraw();
+                });
+            }
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if let Some((token, _)) = key_input(&event, &self.mods) {
+                    self.in_float_view(|a| a.float_key(token, el));
+                    if self.float_close {
+                        self.float_close = false;
+                        self.close_float();
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x, y),
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32 / (WHEEL_PX * 1.0), p.y as f32 / WHEEL_PX),
+                };
+                let ctrl = self.mods.control_key();
+                self.in_float_view(|a| {
+                    if ctrl {
+                        a.float_fit_off();
+                        a.set_zoom(a.zoom * a.zoom_factor(1).powf(dy));
+                    } else {
+                        let k = WHEEL_PX * a.dpi;
+                        a.scroll_by(-dx * k, -dy * k);
+                    }
+                    a.redraw();
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn float_fit_off(&mut self) {
+        self.float_fit = false;
+    }
+
+    /// Keys in the float window: scrolling, zoom and paging only; `q`/Esc close just this window.
+    fn float_key(&mut self, token: String, el: &ActiveEventLoop) {
+        if token == "<Esc>" {
+            self.float_close = true;
+            return;
+        }
+        if let Some((cmd, count)) = self.keys.feed(&self.keymap, Mode::Normal, &token) {
+            match cmd {
+                Command::Quit => self.float_close = true,
+                Command::ScrollDown | Command::ScrollUp | Command::ScrollLeft | Command::ScrollRight | Command::HalfPageDown | Command::HalfPageUp | Command::NextPage | Command::PrevPage | Command::FirstPage | Command::LastPage => self.exec(cmd, count, el),
+                Command::ZoomIn | Command::ZoomOut | Command::ZoomReset | Command::Zoom(_) | Command::FitPage => {
+                    self.float_fit_off();
+                    self.exec(cmd, count, el);
+                }
+                Command::FitWidth => {
+                    self.float_fit = true;
+                    self.float_refit();
+                }
+                _ => {}
+            }
+        }
+        self.keys.clear();
+        self.redraw();
+    }
+
     fn open_palette(&mut self) {
         let mut items: Vec<PickItem> = Vec::new();
         let map = self.analysis.as_ref().map(|a| &a.page_map);
@@ -778,11 +1097,20 @@ impl App {
 
     /// Bump the generation so queued renders are dropped; optionally forget cached tiles.
     fn invalidate(&mut self, clear_cache: bool) {
-        self.render.gen.fetch_add(1, Ordering::Relaxed);
+        if !self.in_float {
+            self.render.gen.fetch_add(1, Ordering::Relaxed);
+        }
         if clear_cache {
             self.cache.clear();
         }
         self.pending.clear();
+        if let Some(f) = self.float.as_mut() {
+            // queued float requests died with the generation; ask for them again
+            f.pending.clear();
+            if let Some(w) = &f.window {
+                w.request_redraw();
+            }
+        }
     }
 
     fn set_zoom(&mut self, z: f32) {
@@ -904,6 +1232,9 @@ impl App {
             Command::Bmark(n) => self.bookmark_here(n),
             Command::Blist => self.open_blist(),
             Command::Palette => self.open_palette(),
+            Command::Float => self.open_float(el),
+            Command::Profile(n) => self.apply_profile(&n, true),
+            Command::ProfileCycle => self.cycle_profile(),
             Command::Recent => self.open_recent(),
             Command::Bdelete(n) => {
                 let ok = matches!((&self.db, &self.key), (Some(d), Some(k)) if d.delete_bookmark(k, &n));
@@ -1643,8 +1974,15 @@ impl App {
 
         let vis = self.visible_tiles();
         let mut wanted: Vec<TileKey> = vis.iter().map(|p| p.key).collect();
-        wanted.extend(self.neighbours(&vis));
-        *self.render.wanted.lock().unwrap() = wanted.clone();
+        if !self.in_float {
+            wanted.extend(self.neighbours(&vis)); // the small float window only keeps what it shows
+        }
+        if self.in_float {
+            self.wanted_float = wanted.clone();
+        } else {
+            self.wanted_main = wanted.clone();
+        }
+        self.sync_wanted();
         let gen = self.render.gen.load(Ordering::Relaxed);
         let recolor = self.applied.recolor.with_enabled(self.cfg.recolor.enabled);
         for k in &wanted {
@@ -1695,6 +2033,7 @@ impl App {
         let pending_keys = self.keys.display();
         let page = self.current_page();
         let printed = self.analysis.as_ref().and_then(|a| a.page_map.pdf_to_printed(page as u32));
+        let profile = self.profile_active.clone().filter(|n| n != "normal");
         let total = self.layout.len();
         let zoom_pct = (self.zoom * 100.0).round() as u32;
         let mode_name = match (&self.overlay, self.mode) {
@@ -1713,7 +2052,7 @@ impl App {
         let job_text = self.job_status.clone();
         let index_auto = self.index_auto;
         let search_pos = self.search.as_ref().map(|s| (s.index().map_or(0, |i| i + 1), s.hits.len(), s.done));
-        let bar_visible = self.cfg.statusbar;
+        let bar_visible = self.cfg.statusbar && !self.in_float && !self.float_solo;
         let under = !self.cfg.recolor.enabled;
         let bg = self.bg;
 
@@ -1763,6 +2102,7 @@ impl App {
                     message: msg.as_ref().map(|(m, e)| (m.as_str(), *e)),
                     page: page + 1,
                     printed: printed.as_deref(),
+                    profile: profile.as_deref(),
                     total,
                     zoom_pct,
                     mode: mode_name,
@@ -1791,6 +2131,9 @@ impl App {
         }
         let _ = window.pre_present_notify();
         let _ = buf.present();
+        if self.float_solo {
+            self.place_float();
+        }
         if let Some(r) = help_rows {
             self.help_rows = r;
         }
@@ -1798,7 +2141,7 @@ impl App {
             self.index_rows = r;
         }
 
-        if page != self.title_page {
+        if page != self.title_page && !self.in_float && !self.float_solo {
             self.title_page = page;
             if let Ok(mut i) = self.info.lock() {
                 i.page = page as u32 + 1;
@@ -1892,11 +2235,19 @@ impl ApplicationHandler<()> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title(format!("strata — {}", self.name))
-            .with_transparent(true)
-            .with_inner_size(LogicalSize::new(900.0, 1000.0))
-            .with_name("strata", "strata");
+        let attrs = if self.float_solo {
+            Window::default_attributes()
+                .with_title("strata-float")
+                .with_transparent(true)
+                .with_inner_size(LogicalSize::new(self.cfg.float_width as f64, self.cfg.float_height as f64))
+                .with_name("strata-float", "strata-float")
+        } else {
+            Window::default_attributes()
+                .with_title(format!("strata — {}", self.name))
+                .with_transparent(true)
+                .with_inner_size(LogicalSize::new(900.0, 1000.0))
+                .with_name("strata", "strata")
+        };
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         let ctx = Context::new(window.clone()).expect("softbuffer context");
         self.surface = Some(Surface::new(&ctx, window.clone()).expect("softbuffer surface"));
@@ -1906,7 +2257,12 @@ impl ApplicationHandler<()> for App {
         self.window = Some(window);
         self.applied.font.1 = 0.0; // re-apply font size at the real dpi
         self.apply_config();
-        if !self.restore_state() {
+        if self.float_solo {
+            self.exec(Command::FitWidth, None, el);
+            if let Some(p) = self.start_page.take() {
+                self.goto_page(p.max(1) as usize - 1);
+            }
+        } else if !self.restore_state() {
             self.exec(Command::FitWidth, None, el);
         }
         if let Some((f, l, c)) = self.start_synctex.take() {
@@ -1939,6 +2295,9 @@ impl ApplicationHandler<()> for App {
             match r {
                 Response::Tile { key, gen, tile } if gen == cur => {
                     self.pending.remove(&key);
+                    if let Some(f) = self.float.as_mut() {
+                        f.pending.remove(&key);
+                    }
                     self.cache.insert(key, tile);
                     tiles = true;
                 }
@@ -2008,15 +2367,20 @@ impl ApplicationHandler<()> for App {
                         eprintln!("strata: first complete frame after {:?}", START.get().map(|t| t.elapsed()).unwrap_or_default());
                     }
                 });
-                self.cache.retain_scale(self.scale_key());
+                let mut scales = vec![self.scale_key()];
+                scales.extend(self.float_scale_key());
+                self.cache.retain_scales(&scales);
             }
         }
         if changed {
-            self.redraw();
+            self.redraw_all();
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
+        if self.float.as_ref().and_then(|f| f.window.as_ref()).is_some_and(|w| w.id() == id) {
+            return self.float_event(el, ev);
+        }
         match ev {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Focused(false) => self.save_state(),

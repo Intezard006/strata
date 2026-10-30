@@ -25,6 +25,23 @@ set auto-analyze         true
 set auto-ocr             true     # OCR scanned documents with ocrmypdf
 set auto-index           auto     # auto: only when the file has no outline | always | off
 
+# Images: keep original colours (photos stay readable); scans (page-sized images) are always recolored
+set recolor-images       keep     # keep | dim | recolor
+set recolor-image-dim    0.85
+set recolor-invert-dark-images false  # recolor dark page-sized images (covers) with an inverted mapping
+set goto-printed         true     # :goto 120 means printed page 120 when the book has page numbers
+
+# Look profiles: Ctrl-t cycles, :profile NAME applies. Without any `profile` line, `normal` and `textbook` exist.
+# profile textbook recolor-lightcolor rgba(0,0,0,0)
+# profile textbook recolor-darkcolor  rgba(255,255,255,1)
+# profile textbook default-bg         rgba(0,0,0,0)
+# profile textbook recolor-keephue    false
+
+# Float window (gf, :float, strata --float FILE [--page N])
+set float-width          520
+set float-height         700
+set float-position       top-right
+
 # State (position, bookmarks, marks) lives in ~/.local/share/strata/strata.db
 set restore-position     true     # reopen at the last page, zoom and recolor state
 

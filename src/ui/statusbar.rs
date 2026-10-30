@@ -9,6 +9,8 @@ pub struct Status<'a> {
     pub page: usize,
     /// Printed page label when the book has a page map.
     pub printed: Option<&'a str>,
+    /// Active look profile when it is not `normal`.
+    pub profile: Option<&'a str>,
     pub total: usize,
     pub zoom_pct: u32,
     pub mode: &'a str,
@@ -38,6 +40,9 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, s: &Status) {
     }
     if let Some(j) = s.job {
         right.push_str(&format!("{j}  "));
+    }
+    if let Some(p) = s.profile {
+        right.push_str(&format!("[{p}]  "));
     }
     if let Some(p) = s.printed {
         right.push_str(&format!("p.{p} "));

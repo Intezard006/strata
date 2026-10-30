@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod ext;
 mod heading;
+mod hypr;
 mod keys;
 mod layout;
 mod links;
@@ -38,9 +39,15 @@ fn main() -> ExitCode {
     }
     let mut file = None;
     let mut sync = None;
+    let mut float = false;
+    let mut page = None;
     let mut it = std::env::args_os().skip(1);
     while let Some(a) = it.next() {
-        if a == "--synctex-forward" {
+        if a == "--float" {
+            float = true;
+        } else if a == "--page" {
+            page = it.next().and_then(|v| v.to_string_lossy().parse::<u32>().ok());
+        } else if a == "--synctex-forward" {
             let spec = it.next().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
             let mut p = spec.splitn(3, ':');
             match (p.next().and_then(|v| v.parse::<u32>().ok()), p.next().and_then(|v| v.parse::<u32>().ok()), p.next()) {
@@ -55,7 +62,7 @@ fn main() -> ExitCode {
         }
     }
     let Some(arg) = file else {
-        eprintln!("usage: strata [--synctex-forward LINE:COL:TEXFILE] <file>\n       strata --exec '<command>' [--pid N]");
+        eprintln!("usage: strata [--synctex-forward LINE:COL:TEXFILE] [--float [--page N]] <file>\n       strata --exec '<command>' [--pid N]");
         return ExitCode::from(2);
     };
     let path = PathBuf::from(arg);
@@ -80,7 +87,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut app = app::App::new(handle, sizes, path, event_loop.create_proxy(), sync);
+    let mut app = app::App::new(handle, sizes, path, event_loop.create_proxy(), app::StartOpts { synctex: sync, float, page });
     let r = event_loop.run_app(&mut app);
     app.save_state();
     if let Err(e) = r {

@@ -112,8 +112,8 @@ impl TileCache {
     }
 
     /// Drop tiles rendered at other scales.
-    pub fn retain_scale(&mut self, scale: u32) {
-        let dead: Vec<TileKey> = self.map.keys().filter(|k| k.scale != scale).copied().collect();
+    pub fn retain_scales(&mut self, scales: &[u32]) {
+        let dead: Vec<TileKey> = self.map.keys().filter(|k| !scales.contains(&k.scale)).copied().collect();
         for k in dead {
             self.bytes -= self.map.remove(&k).unwrap().0.bytes();
         }
@@ -340,6 +340,9 @@ impl Renderer {
             }
             if !self.queue.is_empty() {
                 self.render_next();
+                if self.queue.is_empty() && self.search.is_none() {
+                    unsafe { malloc_trim(0) }; // hand the decode buffers of the burst back to the OS
+                }
             } else if self.search.is_some() {
                 self.search_step();
             }
