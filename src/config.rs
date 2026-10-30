@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::recolor::Recolor;
+use crate::recolor::{ImageMode, Recolor};
 
 pub struct Config {
     pub cache_mb: usize,
@@ -45,6 +45,9 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("recolor-lightcolor", "Paper colour; same RGB as default-bg keeps pages transparent"),
     ("recolor-darkcolor", "Ink colour"),
     ("recolor-keephue", "Keep the hue of coloured ink (true/false)"),
+    ("recolor-images", "Images when recoloring: keep (original colours), dim, recolor"),
+    ("recolor-image-dim", "Brightness of dimmed images (0.2-1)"),
+    ("recolor-invert-dark-images", "Recolor dark page-sized images (covers) with inverted mapping (true/false)"),
     ("scroll-step", "Logical pixels per j/k step"),
     ("zoom-step", "Zoom step in percent"),
     ("page-gap", "Gap between pages in points"),
@@ -159,6 +162,16 @@ impl Config {
                 self.recolor.dark = [c[0], c[1], c[2]];
             }
             "recolor-keephue" => self.recolor.keephue = parse_bool(v)?,
+            "recolor-images" => {
+                self.recolor.images = match v {
+                    "keep" => ImageMode::Keep,
+                    "dim" => ImageMode::Dim,
+                    "recolor" => ImageMode::Recolor,
+                    _ => return Err(format!("recolor-images: expected keep|dim|recolor, got {v}")),
+                }
+            }
+            "recolor-image-dim" => self.recolor.image_dim = parse_num(v, 0.2, 1.0)?,
+            "recolor-invert-dark-images" => self.recolor.invert_dark = parse_bool(v)?,
             "scroll-step" => self.scroll_step = parse_num(v, 1.0, 2000.0)?,
             "zoom-step" => self.zoom_step = parse_num(v, 1.0, 100.0)?,
             "page-gap" => self.page_gap = parse_num(v, 0.0, 200.0)?,
@@ -197,6 +210,9 @@ impl Config {
             "recolor-lightcolor" => fmt_color(self.recolor.light),
             "recolor-darkcolor" => fmt_color([self.recolor.dark[0], self.recolor.dark[1], self.recolor.dark[2], 255]),
             "recolor-keephue" => self.recolor.keephue.to_string(),
+            "recolor-images" => format!("{:?}", self.recolor.images).to_lowercase(),
+            "recolor-image-dim" => self.recolor.image_dim.to_string(),
+            "recolor-invert-dark-images" => self.recolor.invert_dark.to_string(),
             "scroll-step" => self.scroll_step.to_string(),
             "zoom-step" => self.zoom_step.to_string(),
             "page-gap" => self.page_gap.to_string(),

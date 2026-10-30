@@ -14,7 +14,7 @@ use crate::ui::index::Item;
 use winit::event_loop::EventLoopProxy;
 
 use crate::layout::{page_px, tile_grid};
-use crate::recolor::Recolor;
+use crate::recolor::{ImgRect, Recolor, DARK_MEAN};
 
 /// Shrink MuPDF's internal store to this fraction (percent) after each render.
 const STORE_SHRINK_PERCENT: u32 = 10;
@@ -216,6 +216,7 @@ pub fn spawn(path: PathBuf, proxy: EventLoopProxy<()>) -> Result<(RenderHandle, 
                 queue: Vec::new(),
                 search: None,
                 page_cache: None,
+                images: HashMap::new(),
                 tx: resp_tx,
                 proxy,
                 wanted: w2,
@@ -306,6 +307,8 @@ struct Renderer {
     queue: Vec<Request>,
     search: Option<SearchState>,
     page_cache: Option<(u32, mupdf::Page)>,
+    /// Image placements per page (small, capped); the flag says whether darkness was measured.
+    images: HashMap<u32, (Vec<ImgRect>, bool)>,
     tx: Sender<Response>,
     proxy: EventLoopProxy<()>,
     wanted: Arc<Mutex<Vec<TileKey>>>,
@@ -374,6 +377,7 @@ impl Renderer {
                 self.search = None;
                 self.queue.clear();
                 self.page_cache = None;
+                self.images.clear();
                 match open(&path) {
                     Ok((doc, sizes)) => {
                         self.doc = doc;
@@ -405,7 +409,26 @@ impl Renderer {
         .collect()
     }
 
+    /// Image placements of page `p` (points from the page origin), cached; empty when recoloring ignores images.
+    fn images_for(&mut self, p: u32, rc: &Recolor) -> Vec<ImgRect> {
+        if !rc.wants_images() {
+            return Vec::new();
+        }
+        if let Some((v, measured)) = self.images.get(&p) {
+            if *measured || !rc.invert_dark {
+                return v.clone();
+            }
+        }
+        let v = self.doc.load_page(p as i32).ok().map(|page| collect_images(&page, &self.cs, rc.invert_dark)).unwrap_or_default();
+        if self.images.len() >= IMAGE_CACHE_PAGES {
+            self.images.clear();
+        }
+        self.images.insert(p, (v.clone(), rc.invert_dark));
+        v
+    }
+
     fn render_preview(&mut self, req: &PreviewReq) -> Option<Tile> {
+        let imgs = self.images_for(req.page, &req.recolor);
         let page = self.doc.load_page(req.page as i32).ok()?;
         let b = page.bounds().ok()?;
         let s = req.scale;
@@ -421,8 +444,10 @@ impl Renderer {
         let (pw, ph, stride) = (pix.width() as usize, pix.height() as usize, pix.stride() as usize);
         let src = pix.samples();
         let mut data = Vec::with_capacity(pw * ph);
+        let area = (b.x1 - b.x0) * (b.y1 - b.y0);
+        let regions = req.recolor.regions(&imgs, area, s, ((req.rect[0] * s) as i32, (req.rect[1] * s) as i32), (pw as i32, ph as i32));
         for row in 0..ph {
-            data.extend(src[row * stride..row * stride + pw * 4].chunks_exact(4).map(|p| req.recolor.pixel(p[0], p[1], p[2], p[3])));
+            req.recolor.convert_row(&src[row * stride..row * stride + pw * 4], row as i32, &regions, &mut data);
         }
         Some(Tile { w: pw as u32, h: ph as u32, data })
     }
@@ -475,12 +500,13 @@ impl Renderer {
             self.page_cache = self.doc.load_page(k.page as i32).ok().map(|p| (k.page, p));
         }
         // A failed render becomes an empty tile so the UI does not re-request it forever.
+        let imgs = self.images_for(k.page, &req.recolor);
         let tile = self
             .page_cache
             .as_ref()
             .and_then(|(_, page)| {
                 let b = page.bounds().ok()?;
-                render_tile(page, b.x0, b.y0, self.sizes[k.page as usize], k, &req.recolor, &self.cs)
+                render_tile(page, b.x0, b.y0, self.sizes[k.page as usize], k, &req.recolor, &imgs, &self.cs)
             })
             .unwrap_or(Tile { w: 0, h: 0, data: Vec::new() });
         self.shrink_store();
@@ -578,6 +604,7 @@ fn render_tile(
     size: (f32, f32),
     k: TileKey,
     rc: &Recolor,
+    imgs: &[ImgRect],
     cs: &Colorspace,
 ) -> Option<Tile> {
     let s = k.scale_f();
@@ -599,11 +626,79 @@ fn render_tile(
     let (pw, ph, stride) = (pix.width() as usize, pix.height() as usize, pix.stride() as usize);
     let src = pix.samples();
     let mut data = Vec::with_capacity(pw * ph);
+    let regions = rc.regions(imgs, size.0 * size.1, s, (0, ty0), (pw as i32, ph as i32));
     for row in 0..ph {
-        let line = &src[row * stride..row * stride + pw * 4];
-        data.extend(line.chunks_exact(4).map(|p| rc.pixel(p[0], p[1], p[2], p[3])));
+        rc.convert_row(&src[row * stride..row * stride + pw * 4], row as i32, &regions, &mut data);
     }
     Some(Tile { w: pw as u32, h: ph as u32, data })
+}
+
+const IMAGE_CACHE_PAGES: usize = 64;
+
+/// `strata --dump-images FILE [FIRST [LAST]]`: image placements per page (dev aid).
+pub fn dump_images(args: &[String]) -> std::process::ExitCode {
+    let Some(f) = args.first() else { return std::process::ExitCode::from(2) };
+    let Ok(doc) = open_doc(&PathBuf::from(f)) else { return std::process::ExitCode::FAILURE };
+    let n = doc.page_count().unwrap_or(0);
+    let first: i32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(1);
+    let last: i32 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(first);
+    let cs = Colorspace::device_rgb();
+    for p in (first - 1).max(0)..last.min(n) {
+        let Ok(page) = doc.load_page(p) else { continue };
+        let area = page.bounds().map(|b| (b.x1 - b.x0) * (b.y1 - b.y0)).unwrap_or(1.0);
+        for im in collect_images(&page, &cs, true) {
+            let share = (im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1]) / area;
+            println!("p{} {:?} share {:.2} dark {}", p + 1, im.rect.map(|v| v.round()), share, im.dark);
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// Image placements on a page via the structured-text device (images are referenced, not decoded).
+/// With `measure`, each image's region is rendered at thumbnail size to see whether it is dark.
+fn collect_images(page: &mupdf::Page, cs: &Colorspace, measure: bool) -> Vec<ImgRect> {
+    let Ok(b) = page.bounds() else { return Vec::new() };
+    let Ok(tp) = page.to_text_page(mupdf::TextPageFlags::PRESERVE_IMAGES) else { return Vec::new() };
+    let mut out = Vec::new();
+    for blk in tp.blocks() {
+        if blk.r#type() != mupdf::text_page::TextBlockType::Image {
+            continue;
+        }
+        let r = blk.bounds();
+        let rect = [r.x0 - b.x0, r.y0 - b.y0, r.x1 - b.x0, r.y1 - b.y0];
+        if rect[2] - rect[0] < 4.0 || rect[3] - rect[1] < 4.0 {
+            continue; // rules and bullets drawn as images
+        }
+        out.push(ImgRect { rect, dark: measure && mean_luma(page, &b, rect, cs).is_some_and(|m| m < DARK_MEAN) });
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    out
+}
+
+fn mean_luma(page: &mupdf::Page, b: &mupdf::Rect, rect: [f32; 4], cs: &Colorspace) -> Option<f32> {
+    let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
+    let s = 24.0 / w.max(h);
+    let (pw, ph) = ((w * s).ceil().max(1.0) as i32, (h * s).ceil().max(1.0) as i32);
+    let mut pix = Pixmap::new_with_rect(cs, IRect::new(0, 0, pw, ph), false).ok()?;
+    pix.clear_with(255).ok()?;
+    let mut ctm = Matrix::new_translate(-(b.x0 + rect[0]), -(b.y0 + rect[1]));
+    ctm.concat(Matrix::new_scale(s, s));
+    {
+        let dev = Device::from_pixmap(&pix).ok()?;
+        page.run(&dev, &ctm).ok()?;
+    }
+    let n = pix.n() as usize;
+    let (stride, sm) = (pix.stride() as usize, pix.samples());
+    let mut sum = 0u64;
+    for y in 0..ph as usize {
+        for x in 0..pw as usize {
+            let p = &sm[y * stride + x * n..];
+            sum += (54 * p[0] as u64 + 183 * p[1] as u64 + 19 * p[2] as u64) >> 8;
+        }
+    }
+    Some(sum as f32 / (pw * ph) as f32 / 255.0)
 }
 
 #[cfg(test)]

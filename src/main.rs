@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         Some("--dump-lines") => return analyze::dump_lines(&argv[1..]),
         Some("--write-index") => return analyze::write_index(&argv[1..]),
         Some("--dump-previews") => return analyze::dump_previews(&argv[1..]),
+        Some("--dump-images") => return render::dump_images(&argv[1..]),
         Some("--exec") => return ext::run_exec(&argv[1..]),
         _ => {}
     }
