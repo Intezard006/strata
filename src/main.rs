@@ -6,6 +6,7 @@ mod db;
 mod ext;
 mod heading;
 mod hypr;
+mod imagemap;
 mod keys;
 mod layout;
 mod links;
@@ -102,6 +103,9 @@ fn main() -> ExitCode {
     let mut app = app::App::new(handle, sizes, path, event_loop.create_proxy(), app::StartOpts { synctex: sync, float, page });
     let r = event_loop.run_app(&mut app);
     app.save_state();
+    if std::env::var_os("STRATA_DEBUG").is_some() {
+        eprintln!("strata: image classifier calls: {}", imagemap::CLASSIFY_CALLS.load(std::sync::atomic::Ordering::Relaxed));
+    }
     if let Err(e) = r {
         eprintln!("strata: {e}");
         return ExitCode::FAILURE;

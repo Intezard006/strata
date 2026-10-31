@@ -13,8 +13,9 @@ use crate::search::{find_matches, Rect4};
 use crate::ui::index::Item;
 use winit::event_loop::EventLoopProxy;
 
+use crate::imagemap::{self, Class, ImageMap, Ovr};
 use crate::layout::{page_px, tile_grid};
-use crate::recolor::{ImgRect, Recolor, DARK_MEAN};
+use crate::recolor::{ImgRect, Recolor, DARK_MEAN, SCAN_SHARE};
 
 /// `scale` is px-per-point in thousandths, so keys hash exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -195,6 +196,23 @@ pub enum Cmd {
     Open(PathBuf),
     /// Document to use for text search (the OCR copy), or `None` for the original.
     TextSource(Option<PathBuf>),
+    /// Cycle the override of an image on screen (`gi`).
+    ToggleImage(ImagePick),
+}
+
+/// Where to look for the image to toggle: the cursor's page position, else the largest visible image.
+pub struct ImagePick {
+    pub recolor: Recolor,
+    /// Visible pages with the visible rectangle in page points.
+    pub pages: Vec<(u32, [f32; 4])>,
+    /// (page, x, y) in page points when the cursor is over the document.
+    pub cursor: Option<(u32, f32, f32)>,
+}
+
+pub struct Toggled {
+    pub ovr: Ovr,
+    /// What the automatic classification does with this image.
+    pub auto_recolored: bool,
 }
 
 pub enum Response {
@@ -208,6 +226,7 @@ pub enum Response {
     Links { page: u32, links: Vec<LinkInfo> },
     Outline(Vec<Item>),
     Opened(Result<Vec<(f32, f32)>, String>),
+    ImageToggled(Result<Toggled, String>),
 }
 
 pub struct RenderHandle {
@@ -217,6 +236,16 @@ pub struct RenderHandle {
     pub wanted: Arc<Mutex<Vec<TileKey>>>,
     /// Requests with an older generation are dropped.
     pub gen: Arc<AtomicU64>,
+    /// Persisted image decisions of the open document (shared so the viewer can flush and reload them).
+    pub images: Arc<Mutex<ImageMap>>,
+}
+
+/// The persisted image map of `path`'s cache directory (empty and unsaved when there is none).
+pub fn load_image_map(path: &PathBuf) -> ImageMap {
+    match crate::cache::dir_for(path) {
+        Ok(dir) => ImageMap::load(&dir),
+        Err(_) => ImageMap::detached(),
+    }
 }
 
 /// Open the document on a new thread; returns page sizes (points) once loaded.
@@ -226,6 +255,8 @@ pub fn spawn(path: PathBuf, proxy: EventLoopProxy<()>) -> Result<(RenderHandle, 
     let wanted = Arc::new(Mutex::new(Vec::new()));
     let gen = Arc::new(AtomicU64::new(0));
     let (w2, g2) = (wanted.clone(), gen.clone());
+    let imap = Arc::new(Mutex::new(load_image_map(&path)));
+    let i2 = imap.clone();
     thread::Builder::new()
         .name("renderer".into())
         .spawn(move || {
@@ -248,6 +279,7 @@ pub fn spawn(path: PathBuf, proxy: EventLoopProxy<()>) -> Result<(RenderHandle, 
                 search: None,
                 page_cache: None,
                 images: HashMap::new(),
+                imap: i2,
                 tx: resp_tx,
                 proxy,
                 wanted: w2,
@@ -259,7 +291,7 @@ pub fn spawn(path: PathBuf, proxy: EventLoopProxy<()>) -> Result<(RenderHandle, 
         })
         .map_err(|e| e.to_string())?;
     match resp_rx.recv() {
-        Ok(Response::Opened(Ok(sizes))) => Ok((RenderHandle { req_tx, resp_rx, wanted, gen }, sizes)),
+        Ok(Response::Opened(Ok(sizes))) => Ok((RenderHandle { req_tx, resp_rx, wanted, gen, images: imap }, sizes)),
         Ok(Response::Opened(Err(e))) => Err(e),
         _ => Err("renderer thread died".into()),
     }
@@ -340,6 +372,7 @@ struct Renderer {
     page_cache: Option<(u32, mupdf::Page)>,
     /// Image placements per page (small, capped); the flag says whether darkness was measured.
     images: HashMap<u32, (Vec<ImgRect>, u8)>,
+    imap: Arc<Mutex<ImageMap>>,
     tx: Sender<Response>,
     proxy: EventLoopProxy<()>,
     wanted: Arc<Mutex<Vec<TileKey>>>,
@@ -381,6 +414,7 @@ impl Renderer {
                 self.render_next();
                 if self.queue.is_empty() && self.search.is_none() {
                     unsafe { malloc_trim(0) }; // hand the decode buffers of the burst back to the OS
+                    self.flush_images();
                 }
             } else if self.search.is_some() {
                 self.search_step();
@@ -411,6 +445,10 @@ impl Renderer {
                     .and_then(|p| open_doc(&p).ok().filter(|d| d.page_count().map(|c| c as usize == self.sizes.len()).unwrap_or(false)).map(|_| p));
                 self.text_path = usable.unwrap_or_else(|| self.path.clone());
             }
+            Cmd::ToggleImage(pick) => {
+                let r = self.toggle_image(&pick);
+                self.send(Response::ImageToggled(r));
+            }
             Cmd::Links(p) => {
                 let links = self.load_links(p);
                 self.send(Response::Links { page: p, links });
@@ -420,8 +458,12 @@ impl Renderer {
                 self.queue.clear();
                 self.page_cache = None;
                 self.images.clear();
+                self.flush_images();
                 match open(&path) {
                     Ok((doc, sizes)) => {
+                        if let Ok(mut m) = self.imap.lock() {
+                            *m = load_image_map(&path);
+                        }
                         self.doc = doc;
                         self.text_path = path.clone();
                         self.path = path;
@@ -463,12 +505,70 @@ impl Renderer {
                 return v.clone();
             }
         }
-        let v = self.doc.load_page(p as i32).ok().map(|page| collect_images(&page, &self.cs, rc.invert_dark, rc.wants_class())).unwrap_or_default();
+        let v = self.doc.load_page(p as i32).ok().map(|page| collect_images(&page, p, &self.cs, rc.invert_dark, rc.wants_class(), &self.imap)).unwrap_or_default();
         if self.images.len() >= IMAGE_CACHE_PAGES {
             self.images.clear();
         }
         self.images.insert(p, (v.clone(), need));
         v
+    }
+
+    /// Write new image decisions to disk (merging with the child's), if there are any.
+    fn flush_images(&self) {
+        if let Ok(mut m) = self.imap.lock() {
+            if m.is_dirty() {
+                if let Err(e) = m.sync() {
+                    eprintln!("strata: cannot save image decisions: {e}");
+                }
+            }
+        }
+    }
+
+    /// `gi`: cycle the override of the image under the cursor, else of the largest visible image.
+    fn toggle_image(&mut self, pick: &ImagePick) -> Result<Toggled, String> {
+        if !pick.recolor.wants_images() {
+            return Err("images are recolored like text here (recolor off, or recolor-images recolor)".into());
+        }
+        let mut best: Option<(f32, u32, ImgRect)> = None;
+        // the cursor decides first: the smallest image containing it (the innermost one)
+        if let Some((page, x, y)) = pick.cursor {
+            for im in self.images_for(page, &pick.recolor) {
+                let r = im.rect;
+                if x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3] {
+                    let area = (r[2] - r[0]) * (r[3] - r[1]);
+                    if best.as_ref().is_none_or(|b| area < b.0) {
+                        best = Some((area, page, im));
+                    }
+                }
+            }
+        }
+        if best.is_none() {
+            for &(page, vis) in &pick.pages {
+                for im in self.images_for(page, &pick.recolor) {
+                    let r = im.rect;
+                    let (w, h) = (r[2].min(vis[2]) - r[0].max(vis[0]), r[3].min(vis[3]) - r[1].max(vis[1]));
+                    if w > 0.0 && h > 0.0 && best.as_ref().is_none_or(|b| w * h > b.0) {
+                        best = Some((w * h, page, im));
+                    }
+                }
+            }
+        }
+        let Some((_, page, im)) = best else { return Err("No image here".into()) };
+        let (pw, ph) = self.sizes.get(page as usize).copied().unwrap_or((1.0, 1.0));
+        let r = im.rect;
+        let scan = (r[2] - r[0]) * (r[3] - r[1]) > SCAN_SHARE * pw * ph;
+        let auto_recolored = scan || (pick.recolor.wants_class() && im.line);
+        let next = {
+            let mut m = self.imap.lock().map_err(|_| "image map unavailable".to_string())?;
+            let next = imagemap::next_override(m.ovr(im.id), auto_recolored);
+            m.set_ovr(im.id, next);
+            if let Err(e) = m.sync() {
+                eprintln!("strata: cannot save image decisions: {e}");
+            }
+            next
+        };
+        self.images.clear();
+        Ok(Toggled { ovr: next, auto_recolored })
     }
 
     fn render_preview(&mut self, req: &PreviewReq) -> Option<Tile> {
@@ -690,59 +790,31 @@ pub fn dump_images(args: &[String]) -> std::process::ExitCode {
     for p in (first - 1).max(0)..last.min(n) {
         let Ok(page) = doc.load_page(p) else { continue };
         let area = page.bounds().map(|b| (b.x1 - b.x0) * (b.y1 - b.y0)).unwrap_or(1.0);
-        for im in collect_images(&page, &cs, true, true) {
+        let map = Mutex::new(ImageMap::detached());
+        for im in collect_images(&page, p as u32, &cs, true, true, &map) {
             let share = (im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1]) / area;
-            println!("p{} {:?} share {:.2} dark {} line {}", p + 1, im.rect.map(|v| v.round()), share, im.dark, im.line);
+            println!("p{} {:?} share {:.2} dark {} line {} id {:016x}", p + 1, im.rect.map(|v| v.round()), share, im.dark, im.line, im.id);
         }
     }
     std::process::ExitCode::SUCCESS
 }
 
-/// Image placements on a page via the structured-text device (images are referenced, not decoded).
+/// Image placements on a page with their class, ids and overrides. A class is looked up in the
+/// persisted map and only computed (on the whole image, then recorded) when unknown. Scan-sized images
+/// and the crops on a scanned page are never decoded: they are recolored whatever their content.
 /// With `measure`, each image's region is rendered at thumbnail size to see whether it is dark.
-fn collect_images(page: &mupdf::Page, cs: &Colorspace, measure: bool, classify: bool) -> Vec<ImgRect> {
+fn collect_images(page: &mupdf::Page, page_no: u32, cs: &Colorspace, measure: bool, classify: bool, map: &Mutex<ImageMap>) -> Vec<ImgRect> {
     let Ok(b) = page.bounds() else { return Vec::new() };
-    let Ok(tp) = page.to_text_page(mupdf::TextPageFlags::PRESERVE_IMAGES) else { return Vec::new() };
-    let mut out = Vec::new();
-    for blk in tp.blocks() {
-        if blk.r#type() != mupdf::text_page::TextBlockType::Image {
-            continue;
-        }
-        let r = blk.bounds();
-        let rect = [r.x0 - b.x0, r.y0 - b.y0, r.x1 - b.x0, r.y1 - b.y0];
-        if rect[2] - rect[0] < 4.0 || rect[3] - rect[1] < 4.0 {
-            continue; // rules and bullets drawn as images
-        }
-        out.push(ImgRect { rect, dark: measure && mean_luma(page, &b, rect, cs).is_some_and(|m| m < DARK_MEAN), line: classify && is_line(page, &b, rect, cs) });
-        if out.len() >= 64 {
-            break;
-        }
-    }
-    out
-}
-
-/// Render the image's region as a small thumbnail on white and classify it as line art or photo.
-fn is_line(page: &mupdf::Page, b: &mupdf::Rect, rect: [f32; 4], cs: &Colorspace) -> bool {
-    let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
-    let s = 96.0 / w.max(h);
-    let (pw, ph) = ((w * s).ceil().max(1.0) as i32, (h * s).ceil().max(1.0) as i32);
-    let Ok(mut pix) = Pixmap::new_with_rect(cs, IRect::new(0, 0, pw, ph), false) else { return false };
-    if pix.clear_with(255).is_err() {
-        return false;
-    }
-    let mut ctm = Matrix::new_translate(-(b.x0 + rect[0]), -(b.y0 + rect[1]));
-    ctm.concat(Matrix::new_scale(s, s));
-    let Ok(dev) = Device::from_pixmap(&pix) else { return false };
-    if page.run(&dev, &ctm).is_err() {
-        return false;
-    }
-    drop(dev);
-    let n = pix.n() as usize;
-    let (stride, sm) = (pix.stride() as usize, pix.samples());
-    crate::recolor::is_line_art((0..ph as usize).flat_map(|y| (0..pw as usize).map(move |x| (x, y))).map(|(x, y)| {
-        let p = &sm[y * stride + x * n..];
-        [p[0], p[1], p[2]]
-    }))
+    let area = (b.x1 - b.x0) * (b.y1 - b.y0);
+    let ps = imagemap::placements(page, page_no);
+    let scan_page = imagemap::is_scan_page(&ps, area);
+    ps.iter()
+        .map(|p| {
+            let ovr = map.lock().map_or(Ovr::Auto, |m| m.ovr(p.id));
+            let line = classify && !scan_page && p.area() <= SCAN_SHARE * area && imagemap::class_of(map, p, cs) == Class::Line;
+            ImgRect { rect: p.rect, dark: measure && mean_luma(page, &b, p.rect, cs).is_some_and(|m| m < DARK_MEAN), line, id: p.id, ovr }
+        })
+        .collect()
 }
 
 fn mean_luma(page: &mupdf::Page, b: &mupdf::Rect, rect: [f32; 4], cs: &Colorspace) -> Option<f32> {

@@ -17,7 +17,7 @@ use crate::cache::{self, Analysis, IndexEntry, IndexSource, OcrState};
 use crate::heading::{self, size_key, Line};
 use crate::pages::{self, Cand};
 use crate::toc;
-use crate::{previews, pstore};
+use crate::{imagemap, previews, pstore};
 use crate::render::open_doc;
 
 const TEXT_MIN_CHARS: usize = 20;
@@ -31,6 +31,56 @@ fn say(s: &str) {
     if writeln!(o, "{s}").and_then(|_| o.flush()).is_err() {
         std::process::exit(0);
     }
+}
+
+/// `--analyze FILE --images-only`: classify every image of the document that the viewer has not met yet
+/// and merge the decisions into `images.bin` (the viewer's lazy entries and the user's overrides win).
+fn image_job(file: &Path, cap_mb: u64) -> Result<(), String> {
+    let dir = cache::dir_for(file).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    cache::touch(&dir);
+    cache::evict(&cache::cache_root(), &dir, cap_mb.saturating_mul(1 << 20));
+    let _lock = cache::lock(&dir, || say("S waiting for another strata instance...")).map_err(|e| format!("lock: {e}"))?;
+    let mut map = imagemap::ImageMap::load(&dir);
+    if map.is_complete() {
+        return Ok(());
+    }
+    let mut doc = open_doc(&file.to_path_buf())?;
+    let n = doc.page_count().map_err(|e| e.to_string())? as usize;
+    let cs = mupdf::Colorspace::device_rgb();
+    say("S classifying images...");
+    for p in 0..n {
+        if p > 0 && p % REOPEN_EVERY == 0 {
+            if let Ok(d) = open_doc(&file.to_path_buf()) {
+                doc = d;
+            }
+        }
+        if p % PROGRESS_EVERY == 0 {
+            say(&format!("P {p} {n}"));
+        }
+        let Ok(page) = doc.load_page(p as i32) else { continue };
+        let Ok(b) = page.bounds() else { continue };
+        let area = (b.x1 - b.x0) * (b.y1 - b.y0);
+        let ps = imagemap::placements(&page, p as u32);
+        let scan_page = imagemap::is_scan_page(&ps, area);
+        for pl in &ps {
+            let known = map.class(pl.id);
+            if scan_page || pl.area() > crate::recolor::SCAN_SHARE * area {
+                // recolored whatever it contains, by geometry alone: no decoding, and nothing to
+                // remember (a 1000-page scan would otherwise add thousands of useless entries)
+            } else if !matches!(known, Some(c) if c != imagemap::Class::Scan) {
+                map.set_class(pl.id, imagemap::classify(&pl.image, &cs));
+            }
+        }
+        drop(ps);
+        drop(page);
+        imagemap::empty_store();
+        if p % 64 == 63 && map.is_dirty() {
+            map.sync().map_err(|e| e.to_string())?;
+        }
+    }
+    map.mark_complete();
+    map.sync().map_err(|e| e.to_string())
 }
 
 /// One page of lines with their geometry, before gap analysis.
@@ -280,7 +330,8 @@ pub fn run(args: &[String]) -> ExitCode {
     let flag = |f: &str| args.iter().any(|a| a == f);
     let cap_mb: u64 = args.iter().position(|a| a == "--cache-max-mb").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(2048);
     install_term_handler();
-    match analyze(&file, flag("--ocr"), flag("--no-ocr"), flag("--force"), cap_mb, !flag("--no-previews")) {
+    let result = if flag("--images-only") { image_job(&file, cap_mb) } else { analyze(&file, flag("--ocr"), flag("--no-ocr"), flag("--force"), cap_mb, !flag("--no-previews")) };
+    match result {
         Ok(()) => {
             say("D");
             ExitCode::SUCCESS

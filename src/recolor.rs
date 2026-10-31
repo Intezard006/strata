@@ -2,6 +2,8 @@
 //! "light" colour is simply transparency (the window background shows through) and
 //! dark ink is mapped to `dark` with coverage derived from luminance and alpha.
 
+use crate::imagemap::Ovr;
+
 /// What happens to embedded images (photos, plots) when recoloring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageMode {
@@ -85,6 +87,10 @@ pub struct ImgRect {
     pub dark: bool,
     /// Classified as line art / a diagram (only measured in `ImageMode::Smart`).
     pub line: bool,
+    /// Stable image id (see `imagemap`), for overrides.
+    pub id: u64,
+    /// The user's decision for this image.
+    pub ovr: crate::imagemap::Ovr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -139,7 +145,11 @@ impl Recolor {
             let r = im.rect;
             let area = (r[2] - r[0]) * (r[3] - r[1]);
             let scan = scan_page || area > SCAN_SHARE * page_area;
-            let kind = if im.dark && self.invert_dark && scan {
+            let kind = if im.ovr == Ovr::Keep {
+                RegionKind::Keep
+            } else if im.ovr == Ovr::Recolor {
+                RegionKind::LineArt
+            } else if im.dark && self.invert_dark && scan {
                 RegionKind::Invert
             } else if scan || self.images == ImageMode::Recolor {
                 continue;
@@ -304,8 +314,8 @@ mod tests {
     fn regions_skip_scans_and_mask_pixels() {
         let rc = Recolor::default(); // Keep
         let page_area = 600.0 * 800.0;
-        let photo = ImgRect { rect: [100.0, 100.0, 200.0, 150.0], dark: false, line: false };
-        let big = ImgRect { rect: [0.0, 400.0, 600.0, 790.0], dark: false, line: false }; // under the scan share
+        let photo = ImgRect { rect: [100.0, 100.0, 200.0, 150.0], dark: false, line: false, id: 0, ovr: Ovr::Auto };
+        let big = ImgRect { rect: [0.0, 400.0, 600.0, 790.0], dark: false, line: false, id: 0, ovr: Ovr::Auto }; // under the scan share
         let r = rc.regions(&[photo, big], page_area, 1.0, (0, 0), (600, 800));
         assert_eq!(r.len(), 2);
         let r = rc.regions(&[photo], page_area, 1.0, (0, 0), (600, 800));
@@ -329,15 +339,15 @@ mod tests {
     #[test]
     fn scanned_page_crops_are_recolored() {
         let rc = Recolor::default();
-        let scan = ImgRect { rect: [0.0, 0.0, 600.0, 790.0], dark: false, line: false };
-        let crop = ImgRect { rect: [100.0, 100.0, 300.0, 130.0], dark: false, line: false };
+        let scan = ImgRect { rect: [0.0, 0.0, 600.0, 790.0], dark: false, line: false, id: 0, ovr: Ovr::Auto };
+        let crop = ImgRect { rect: [100.0, 100.0, 300.0, 130.0], dark: false, line: false, id: 0, ovr: Ovr::Auto };
         assert!(rc.regions(&[scan, crop], 600.0 * 800.0, 1.0, (0, 0), (600, 800)).is_empty());
     }
 
     #[test]
     fn regions_are_clipped_to_the_tile() {
         let rc = Recolor::default();
-        let im = ImgRect { rect: [10.0, 100.0, 90.0, 300.0], dark: false, line: false };
+        let im = ImgRect { rect: [10.0, 100.0, 90.0, 300.0], dark: false, line: false, id: 0, ovr: Ovr::Auto };
         // tile covers page rows 200..260 of a 100px wide page
         let r = rc.regions(&[im], 1.0e6, 1.0, (0, 200), (100, 60));
         assert_eq!((r[0].y0, r[0].y1), (0, 60));
@@ -346,12 +356,25 @@ mod tests {
 
     #[test]
     fn recolor_mode_and_off_ignore_images() {
-        let im = ImgRect { rect: [0.0, 0.0, 10.0, 10.0], dark: false, line: false };
+        let im = ImgRect { rect: [0.0, 0.0, 10.0, 10.0], dark: false, line: false, id: 0, ovr: Ovr::Auto };
         let rc = Recolor { images: ImageMode::Recolor, ..Recolor::default() };
         assert!(rc.regions(&[im], 1.0e6, 1.0, (0, 0), (50, 50)).is_empty());
         assert!(!rc.wants_images());
         assert!(!Recolor { enabled: false, ..Recolor::default() }.wants_images());
         assert!(Recolor::default().wants_images());
+    }
+
+    #[test]
+    fn overrides_beat_class_and_scan() {
+        let rc = Recolor::default();
+        let mk = |line, ovr| ImgRect { rect: [100.0, 100.0, 200.0, 150.0], dark: false, line, id: 7, ovr };
+        let kind = |im: ImgRect| rc.regions(&[im], 600.0 * 800.0, 1.0, (0, 0), (600, 800)).first().map(|r| r.kind);
+        assert_eq!(kind(mk(true, Ovr::Auto)), Some(RegionKind::LineArt));
+        assert_eq!(kind(mk(true, Ovr::Keep)), Some(RegionKind::Keep));
+        assert_eq!(kind(mk(false, Ovr::Recolor)), Some(RegionKind::LineArt));
+        assert_eq!(kind(mk(false, Ovr::Auto)), Some(RegionKind::Keep));
+        let scan = ImgRect { rect: [0.0, 0.0, 600.0, 790.0], dark: false, line: false, id: 8, ovr: Ovr::Keep };
+        assert_eq!(rc.regions(&[scan], 600.0 * 800.0, 1.0, (0, 0), (600, 800))[0].kind, RegionKind::Keep);
     }
 
     #[test]
@@ -367,7 +390,7 @@ mod tests {
 
     #[test]
     fn dark_scans_are_inverted_only_when_asked() {
-        let dark_scan = ImgRect { rect: [0.0, 0.0, 600.0, 800.0], dark: true, line: false };
+        let dark_scan = ImgRect { rect: [0.0, 0.0, 600.0, 800.0], dark: true, line: false, id: 0, ovr: Ovr::Auto };
         let mut rc = Recolor::default();
         assert!(rc.regions(&[dark_scan], 600.0 * 800.0, 1.0, (0, 0), (600, 800)).is_empty());
         rc.invert_dark = true;
@@ -421,8 +444,8 @@ mod tests {
     #[test]
     fn smart_mode_recolors_line_art_regions_only() {
         let rc = Recolor::default();
-        let art = ImgRect { rect: [100.0, 100.0, 200.0, 150.0], dark: false, line: true };
-        let photo = ImgRect { rect: [300.0, 100.0, 400.0, 150.0], dark: false, line: false };
+        let art = ImgRect { rect: [100.0, 100.0, 200.0, 150.0], dark: false, line: true, id: 0, ovr: Ovr::Auto };
+        let photo = ImgRect { rect: [300.0, 100.0, 400.0, 150.0], dark: false, line: false, id: 0, ovr: Ovr::Auto };
         let r = rc.regions(&[art, photo], 600.0 * 800.0, 1.0, (0, 0), (600, 800));
         assert_eq!(r.len(), 2);
         assert_eq!((r[0].kind, r[1].kind), (RegionKind::LineArt, RegionKind::Keep));

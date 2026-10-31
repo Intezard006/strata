@@ -20,6 +20,10 @@ page numbers, `:goto #120` to PDF page 120, `:goto xii` to front matter. `Ctrl-t
 `textbook`, or your own `profile NAME OPTION VALUE` lines). `gf` opens a small floating, pinned window with the current
 page (or the preview target) inside the same process; `strata --float FILE --page N` does the same from a script.
 Images keep their colours in recolor mode (`set recolor-images keep|dim|recolor`).
+In the default `smart` mode each image is classified once (line art is recolored, photos keep their colours) and the
+decision is stored per document in `~/.cache/strata/<key>/images.bin`; a background pass fills in the rest. `gi`
+(`:image-toggle`) cycles the image under the cursor, or the largest one on screen, through keep / recolor / auto; the
+override is stored in the same file and survives reclassification.
 
 State (last position, zoom, recolor, bookmarks, marks, jumplist) is stored in `~/.local/share/strata/strata.db` and
 written on close, focus loss, `:open` and SIGTERM/SIGINT; `set restore-position false` turns restoring off.

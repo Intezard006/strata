@@ -25,7 +25,8 @@ use crate::links::{hint_labels, open_external, Jumplist, LinkInfo, Target, HINT_
 use crate::recolor::Recolor;
 use crate::previews::{Kind, Ref};
 use crate::pstore::Store;
-use crate::render::{Cmd, PreviewReq, RenderHandle, Request, Response, SearchReq, Tile, TileCache, TileKey};
+use crate::imagemap::Ovr;
+use crate::render::{Cmd, ImagePick, PreviewReq, RenderHandle, Request, Response, SearchReq, Tile, TileCache, TileKey, Toggled};
 use crate::search::{case_sensitive, Hit, Search};
 use crate::text::TextRenderer;
 use crate::ui::help::Help;
@@ -220,6 +221,8 @@ pub struct App {
 #[derive(Clone, Debug)]
 enum JobKind {
     Analyze,
+    /// Background classification of every image (`--images-only`).
+    Images,
     WriteIndex(PathBuf),
 }
 
@@ -453,6 +456,7 @@ impl App {
                 let need_previews = self.cfg.previews && !a.previews.done && self.cfg.auto_analyze;
                 self.apply_analysis(a, &dir);
                 if !need_previews {
+                    self.maybe_start_images();
                     return;
                 }
                 recompute = true; // cached before previews were wanted: one more pass
@@ -476,6 +480,21 @@ impl App {
             args.push("--no-previews");
         }
         self.spawn_job(&args, JobKind::Analyze);
+    }
+
+    /// Whether the persisted image map still lacks a finished whole-document pass that smart recoloring wants.
+    fn need_images(&self) -> bool {
+        self.cfg.auto_analyze && self.cfg.effective_recolor().wants_class() && !self.render.images.lock().map_or(true, |m| m.is_complete())
+    }
+
+    /// Start the niced image classification child when it is wanted and nothing else is running.
+    fn maybe_start_images(&mut self) {
+        if self.job.is_some() || self.opening.is_some() || !self.need_images() {
+            return;
+        }
+        let file = self.path.display().to_string();
+        let cap = self.cfg.cache_max_mb.to_string();
+        self.spawn_job(&["--analyze", file.as_str(), "--images-only", "--cache-max-mb", cap.as_str()], JobKind::Images);
     }
 
     fn spawn_job(&mut self, args: &[&str], kind: JobKind) {
@@ -525,7 +544,10 @@ impl App {
             return; // from a cancelled job
         }
         match m {
-            Msg::Progress(d, t) => self.job_status = Some(format!("analysing {d}/{t}")),
+            Msg::Progress(d, t) => {
+                let what = if matches!(self.job.as_ref().map(|j| &j.1), Some(JobKind::Images)) { "classifying images" } else { "analysing" };
+                self.job_status = Some(format!("{what} {d}/{t}"));
+            }
             Msg::Status(s) => self.job_status = Some(s),
             Msg::Error(e) => self.err(e),
             Msg::Done => {
@@ -533,6 +555,14 @@ impl App {
                 self.job_status = None;
                 match kind {
                     Some(JobKind::WriteIndex(dst)) => self.msg(format!("Wrote {}", dst.display())),
+                    Some(JobKind::Images) => {
+                        // merge what the child found; entries the viewer met meanwhile and overrides stay
+                        if let Ok(mut m) = self.render.images.lock() {
+                            if let Err(e) = m.sync() {
+                                eprintln!("strata: cannot reload image decisions: {e}");
+                            }
+                        }
+                    }
                     _ => {
                         if let Ok(dir) = cache::dir_for(&self.path) {
                             if let Some(a) = cache::load(&dir) {
@@ -547,11 +577,15 @@ impl App {
                 }
             }
             Msg::Exited => {
+                let was_analysis = matches!(self.job.as_ref().map(|j| &j.1), Some(JobKind::Analyze));
                 if let Some(j) = self.job.as_mut() {
                     j.0.mark_exited();
                 }
                 self.job = None;
                 self.job_status = None;
+                if was_analysis {
+                    self.maybe_start_images();
+                }
             }
         }
     }
@@ -631,6 +665,11 @@ impl App {
 
     /// Write the position and jumplist; called on close, focus loss, `open`, signals and exit.
     pub fn save_state(&self) {
+        if let Ok(mut m) = self.render.images.lock() {
+            if m.is_dirty() {
+                let _ = m.sync();
+            }
+        }
         let (Some(db), Some(key)) = (&self.db, &self.key) else { return };
         if self.opening.is_some() || self.window.is_none() || self.float_solo {
             return;
@@ -1164,6 +1203,43 @@ impl App {
         self.redraw();
     }
 
+    /// `gi`: ask the renderer to cycle the override of the image under the cursor / the largest visible one.
+    fn image_toggle(&mut self) {
+        let s = self.scale();
+        let (vw, vh) = self.vp_pt();
+        let x0 = self.x0();
+        let pages = self
+            .layout
+            .visible(self.sy, self.sy + vh)
+            .map(|p| {
+                let (l, t) = (self.layout.left(p), self.layout.top(p));
+                (p as u32, [x0 - l, self.sy - t, x0 - l + vw, self.sy - t + vh])
+            })
+            .collect();
+        let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let cursor = (mx >= 0.0 && my >= 0.0 && my < self.doc_h() as f32 && mx < self.vp.0 as f32).then(|| {
+            let (xp, yp) = (x0 + mx / s, self.sy + my / s);
+            let p = self.layout.page_at(yp);
+            (p as u32, xp - self.layout.left(p), yp - self.layout.top(p))
+        });
+        let _ = self.render.req_tx.send(Cmd::ToggleImage(ImagePick { recolor: self.cfg.effective_recolor(), pages, cursor }));
+    }
+
+    fn on_image_toggled(&mut self, r: Result<Toggled, String>) {
+        match r {
+            Err(e) => self.err(e),
+            Ok(t) => {
+                // tiles already rendered carry the old look
+                self.invalidate(true);
+                let look = if t.auto_recolored { "recolor" } else { "keep" };
+                self.msg(match t.ovr {
+                    Ovr::Auto => format!("image: auto ({look})"),
+                    o => format!("image: {} (override)", o.name()),
+                });
+            }
+        }
+    }
+
     fn current_page(&self) -> usize {
         self.layout.page_at(self.sy + self.vp_pt().1 / 2.0)
     }
@@ -1315,6 +1391,7 @@ impl App {
                 self.cfg.recolor.enabled = !self.cfg.recolor.enabled;
                 self.apply_config();
             }
+            Command::ImageToggle => self.image_toggle(),
             Command::ToggleStatusbar => {
                 self.cfg.statusbar = !self.cfg.statusbar;
                 self.clamp_scroll();
@@ -2484,6 +2561,7 @@ impl ApplicationHandler<()> for App {
                     self.refresh_index();
                 }
                 Response::Opened(r) => self.on_opened(r),
+                Response::ImageToggled(r) => self.on_image_toggled(r),
             }
         }
         while let Ok((id, m)) = self.worker_rx.try_recv() {
