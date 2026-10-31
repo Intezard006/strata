@@ -80,7 +80,7 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("recolor-lightcolor", "Paper colour; same RGB as default-bg keeps pages transparent"),
     ("recolor-darkcolor", "Ink colour"),
     ("recolor-keephue", "Keep the hue of coloured ink (true/false)"),
-    ("recolor-images", "Images when recoloring: keep (original colours), dim, recolor"),
+    ("recolor-images", "Images when recoloring: smart (line art recolored, photos kept), keep, dim, recolor"),
     ("recolor-image-dim", "Brightness of dimmed images (0.2-1)"),
     ("recolor-invert-dark-images", "Recolor dark page-sized images (covers) with inverted mapping (true/false)"),
     ("scroll-step", "Logical pixels per j/k step"),
@@ -209,8 +209,9 @@ impl Config {
                 self.recolor.images = match v {
                     "keep" => ImageMode::Keep,
                     "dim" => ImageMode::Dim,
+                    "smart" => ImageMode::Smart,
                     "recolor" => ImageMode::Recolor,
-                    _ => return Err(format!("recolor-images: expected keep|dim|recolor, got {v}")),
+                    _ => return Err(format!("recolor-images: expected smart|keep|dim|recolor, got {v}")),
                 }
             }
             "recolor-image-dim" => self.recolor.image_dim = parse_num(v, 0.2, 1.0)?,

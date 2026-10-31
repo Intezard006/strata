@@ -339,7 +339,7 @@ struct Renderer {
     search: Option<SearchState>,
     page_cache: Option<(u32, mupdf::Page)>,
     /// Image placements per page (small, capped); the flag says whether darkness was measured.
-    images: HashMap<u32, (Vec<ImgRect>, bool)>,
+    images: HashMap<u32, (Vec<ImgRect>, u8)>,
     tx: Sender<Response>,
     proxy: EventLoopProxy<()>,
     wanted: Arc<Mutex<Vec<TileKey>>>,
@@ -456,16 +456,18 @@ impl Renderer {
         if !rc.wants_images() {
             return Vec::new();
         }
-        if let Some((v, measured)) = self.images.get(&p) {
-            if *measured || !rc.invert_dark {
+        // bit 0: darkness measured, bit 1: line art / photo classified
+        let need = u8::from(rc.invert_dark) | (u8::from(rc.wants_class()) << 1);
+        if let Some((v, done)) = self.images.get(&p) {
+            if done & need == need {
                 return v.clone();
             }
         }
-        let v = self.doc.load_page(p as i32).ok().map(|page| collect_images(&page, &self.cs, rc.invert_dark)).unwrap_or_default();
+        let v = self.doc.load_page(p as i32).ok().map(|page| collect_images(&page, &self.cs, rc.invert_dark, rc.wants_class())).unwrap_or_default();
         if self.images.len() >= IMAGE_CACHE_PAGES {
             self.images.clear();
         }
-        self.images.insert(p, (v.clone(), rc.invert_dark));
+        self.images.insert(p, (v.clone(), need));
         v
     }
 
@@ -688,9 +690,9 @@ pub fn dump_images(args: &[String]) -> std::process::ExitCode {
     for p in (first - 1).max(0)..last.min(n) {
         let Ok(page) = doc.load_page(p) else { continue };
         let area = page.bounds().map(|b| (b.x1 - b.x0) * (b.y1 - b.y0)).unwrap_or(1.0);
-        for im in collect_images(&page, &cs, true) {
+        for im in collect_images(&page, &cs, true, true) {
             let share = (im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1]) / area;
-            println!("p{} {:?} share {:.2} dark {}", p + 1, im.rect.map(|v| v.round()), share, im.dark);
+            println!("p{} {:?} share {:.2} dark {} line {}", p + 1, im.rect.map(|v| v.round()), share, im.dark, im.line);
         }
     }
     std::process::ExitCode::SUCCESS
@@ -698,7 +700,7 @@ pub fn dump_images(args: &[String]) -> std::process::ExitCode {
 
 /// Image placements on a page via the structured-text device (images are referenced, not decoded).
 /// With `measure`, each image's region is rendered at thumbnail size to see whether it is dark.
-fn collect_images(page: &mupdf::Page, cs: &Colorspace, measure: bool) -> Vec<ImgRect> {
+fn collect_images(page: &mupdf::Page, cs: &Colorspace, measure: bool, classify: bool) -> Vec<ImgRect> {
     let Ok(b) = page.bounds() else { return Vec::new() };
     let Ok(tp) = page.to_text_page(mupdf::TextPageFlags::PRESERVE_IMAGES) else { return Vec::new() };
     let mut out = Vec::new();
@@ -711,12 +713,36 @@ fn collect_images(page: &mupdf::Page, cs: &Colorspace, measure: bool) -> Vec<Img
         if rect[2] - rect[0] < 4.0 || rect[3] - rect[1] < 4.0 {
             continue; // rules and bullets drawn as images
         }
-        out.push(ImgRect { rect, dark: measure && mean_luma(page, &b, rect, cs).is_some_and(|m| m < DARK_MEAN) });
+        out.push(ImgRect { rect, dark: measure && mean_luma(page, &b, rect, cs).is_some_and(|m| m < DARK_MEAN), line: classify && is_line(page, &b, rect, cs) });
         if out.len() >= 64 {
             break;
         }
     }
     out
+}
+
+/// Render the image's region as a small thumbnail on white and classify it as line art or photo.
+fn is_line(page: &mupdf::Page, b: &mupdf::Rect, rect: [f32; 4], cs: &Colorspace) -> bool {
+    let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
+    let s = 96.0 / w.max(h);
+    let (pw, ph) = ((w * s).ceil().max(1.0) as i32, (h * s).ceil().max(1.0) as i32);
+    let Ok(mut pix) = Pixmap::new_with_rect(cs, IRect::new(0, 0, pw, ph), false) else { return false };
+    if pix.clear_with(255).is_err() {
+        return false;
+    }
+    let mut ctm = Matrix::new_translate(-(b.x0 + rect[0]), -(b.y0 + rect[1]));
+    ctm.concat(Matrix::new_scale(s, s));
+    let Ok(dev) = Device::from_pixmap(&pix) else { return false };
+    if page.run(&dev, &ctm).is_err() {
+        return false;
+    }
+    drop(dev);
+    let n = pix.n() as usize;
+    let (stride, sm) = (pix.stride() as usize, pix.samples());
+    crate::recolor::is_line_art((0..ph as usize).flat_map(|y| (0..pw as usize).map(move |x| (x, y))).map(|(x, y)| {
+        let p = &sm[y * stride + x * n..];
+        [p[0], p[1], p[2]]
+    }))
 }
 
 fn mean_luma(page: &mupdf::Page, b: &mupdf::Rect, rect: [f32; 4], cs: &Colorspace) -> Option<f32> {
