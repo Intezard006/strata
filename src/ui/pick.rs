@@ -93,34 +93,59 @@ pub struct Pick {
     shown: Vec<usize>,
 }
 
-/// Fuzzy score of `needle` in `hay` (subsequence, case-insensitive; whitespace in the needle ignored).
-/// Consecutive runs, word starts and a contiguous match score higher. `None` when it does not match.
-pub fn score(needle: &str, hay: &str) -> Option<i32> {
-    let n: Vec<char> = needle.chars().flat_map(|c| c.to_lowercase()).filter(|c| !c.is_whitespace()).collect();
-    if n.is_empty() {
-        return Some(0);
-    }
-    let h: Vec<char> = hay.chars().flat_map(|c| c.to_lowercase()).collect();
-    let (mut ni, mut total, mut last): (usize, i32, Option<usize>) = (0, 0, None);
-    for (i, &c) in h.iter().enumerate() {
-        if ni < n.len() && c == n[ni] {
-            total += 10;
-            if last == Some(i.wrapping_sub(1)) {
-                total += 8;
+/// Score of one query word in `h` (lowercase chars): a contiguous match at a word start scores
+/// far above one inside a word, which scores above a tight scattered subsequence (3+ letters only).
+fn word_score(w: &[char], h: &[char]) -> Option<i32> {
+    let n = w.len();
+    let boundary = |i: usize| i == 0 || !h[i - 1].is_alphanumeric();
+    let mut best: Option<i32> = None;
+    if n <= h.len() {
+        for i in 0..=h.len() - n {
+            if h[i..i + n] != *w {
+                continue;
             }
-            if i == 0 || !h[i - 1].is_alphanumeric() {
-                total += 6;
+            let mut s = if boundary(i) { 100 } else if n >= 3 && w.iter().any(|c| c.is_alphabetic()) { 45 } else { continue };
+            if i + n == h.len() || !h[i + n].is_alphanumeric() {
+                s += 40; // a whole word / label
             }
-            last = Some(i);
-            ni += 1;
+            best = best.max(Some(s - (i as i32 / 8).min(10)));
         }
     }
-    if ni < n.len() {
+    if best.is_some() {
+        return best;
+    }
+    // scattered letters: only for longer words, starting at a word start and kept close together
+    if n < 3 || !w.iter().all(|c| c.is_alphabetic()) {
         return None;
     }
-    let joined: String = n.iter().collect();
-    if h.iter().collect::<String>().contains(&joined) {
-        total += 30;
+    for start in (0..h.len()).filter(|&i| boundary(i) && h[i] == w[0]) {
+        let (mut wi, mut last) = (0, start);
+        for (k, &c) in h.iter().enumerate().skip(start) {
+            if wi < n && c == w[wi] {
+                wi += 1;
+                last = k;
+            }
+        }
+        if wi == n && last - start < 2 * n + 2 {
+            return Some(20);
+        }
+    }
+    None
+}
+
+/// Score of `needle` in `hay` (case-insensitive). Every whitespace-separated word of the needle must
+/// match; `None` when one does not. Contiguous and word-start matches dominate loose subsequences.
+pub fn score(needle: &str, hay: &str) -> Option<i32> {
+    let h: Vec<char> = hay.chars().flat_map(|c| c.to_lowercase()).collect();
+    let mut total = 0;
+    let mut any = false;
+    for w in needle.split_whitespace() {
+        any = true;
+        let w: Vec<char> = w.chars().flat_map(|c| c.to_lowercase()).collect();
+        total += word_score(&w, &h)?;
+    }
+    if !any {
+        return Some(0);
     }
     Some(total - (h.len() as i32 / 16).min(10))
 }
@@ -144,7 +169,16 @@ impl Pick {
             if only.is_some_and(|g| g != it.group) {
                 continue;
             }
-            let Some(s) = score(needle, &format!("{} {}", it.label, it.detail)) else { continue };
+            let Some(mut s) = score(needle, &format!("{} {} {}", it.label, it.detail, if it.group == Group::Command { it.right.as_str() } else { "" })) else { continue };
+            let nl = needle.trim().to_lowercase();
+            if !nl.is_empty() {
+                if it.label.to_lowercase() == nl {
+                    s += 500; // exact label
+                }
+                if it.group == Group::Command && !it.right.is_empty() && it.right.to_lowercase() == nl.replace(' ', "") {
+                    s += 1000; // exact key binding
+                }
+            }
             let rank = if needle.trim().is_empty() { it.group.priority() * 100 + it.bonus - (i as i32).min(99) } else { s * 4 + it.group.priority() + it.bonus };
             v.push((rank, i));
         }
@@ -238,7 +272,10 @@ mod tests {
 
     #[test]
     fn scoring_prefers_tight_matches() {
-        assert!(score("zoom", "zoom-in").unwrap() > score("zoom", "z-o-o-m").unwrap());
+        assert!(score("zoom", "zoom-in").unwrap() > score("zoom", "z-o-o-m").map_or(0, |v| v));
+        assert!(score("6.7", "Figure 16.7").is_none(), "a number must start a word");
+        assert!(score("figure 6.7", "Figure 6.7 caption").unwrap() > 200);
+        assert!(score("gf", "fit-page Fit the page").is_none());
         assert!(score("xyz", "zoom").is_none());
         assert_eq!(score("", "anything"), Some(0));
         assert!(score("fit w", "fit-width").unwrap() > 0);
@@ -290,7 +327,7 @@ mod tests {
         let mut p = Pick::new(PickKind::Bookmarks, "B", vec![it("intro", "p.2", Group::Plain), it("chapter3", "p.30", Group::Plain), it("proofs", "p.99", Group::Plain)]);
         p.type_char('p');
         p.type_char('r');
-        assert_eq!(p.shown(), &[1, 2]);
+        assert_eq!(p.shown(), &[2]);
         p.move_sel(5);
         assert_eq!(p.current().unwrap().label, "proofs");
         p.backspace();

@@ -88,7 +88,7 @@ const GAP: i32 = 8;
 /// Panel size for a tile inside a window of `vw` x `vh`.
 pub fn panel_size(tile: Option<&Tile>, vw: i32, vh: i32, zoom: f32, line_h: i32) -> (i32, i32) {
     let max_w = ((0.6 * vw as f32 * zoom.max(1.0)) as i32).min(vw * 95 / 100);
-    let max_h = ((0.6 * vh as f32 * zoom.max(1.0)) as i32).min(vh * 90 / 100);
+    let max_h = vh * 90 / 100;
     let (tw, th) = tile.map_or((vw / 4, line_h * 3), |t| (t.w as i32, t.h as i32));
     ((tw + 2 * PAD).min(max_w), (th + 2 * PAD + line_h + 4).min(max_h))
 }
@@ -133,15 +133,21 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup, bottom_reserve
     let body_h = h - (t.line_h + 6) - 1;
     match &p.tile {
         Some(tile) if tile.w > 0 => {
-            let max_scroll = (tile.h as i32 - body_h + PAD).max(0);
+            let max_scroll = (tile.h as i32 + PAD - body_h).max(0);
             p.scroll = p.scroll.min(max_scroll);
             // clip to the body area by blitting into a sub-canvas row range
             let clip_bottom = body_y + body_h;
             cv.blit(tile.w as i64, tile.h as i64, &tile.data, (x + PAD) as i64, (body_y - p.scroll + PAD / 2) as i64, clip_bottom as i64, false);
             if max_scroll > 0 {
                 let frac = p.scroll as f32 / max_scroll as f32;
-                let bar_h = (body_h as f32 * body_h as f32 / (tile.h as f32 + PAD as f32)).max(12.0) as i32;
-                cv.fill_rect(x + w - 4, body_y + ((body_h - bar_h) as f32 * frac) as i32, 3, bar_h, pm(DIM, 0xa0));
+                let bar_h = (body_h as f32 * body_h as f32 / (tile.h as f32 + PAD as f32)).max(14.0) as i32;
+                cv.fill_rect(x + w - 6, body_y, 3, body_h, pm(DIM, 0x40));
+                cv.fill_rect(x + w - 6, body_y + ((body_h - bar_h) as f32 * frac) as i32, 3, bar_h, pm(ACCENT, 0xe0));
+                if p.scroll < max_scroll {
+                    let sh = t.line_h + 2;
+                    cv.fill_rect(x + 1, y + h - sh - 1, w - 2, sh, pm([bg[0] / 2, bg[1] / 2, bg[2] / 2], 0xff));
+                    t.draw(cv, x + PAD, y + h - sh, "v more  (j/k or wheel to scroll)", ACCENT, w - 2 * PAD);
+                }
             }
         }
         Some(_) => {
@@ -177,7 +183,7 @@ mod tests {
     fn panel_is_capped_to_the_window() {
         let tile = Tile { w: 2000, h: 3000, data: vec![] };
         let (w, h) = panel_size(Some(&tile), 1000, 800, 1.0, 16);
-        assert_eq!((w, h), (600, 480));
+        assert_eq!((w, h), (600, 720));
         let (w, _) = panel_size(Some(&tile), 1000, 800, 2.0, 16);
         assert_eq!(w, 950);
         let small = Tile { w: 100, h: 50, data: vec![] };

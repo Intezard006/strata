@@ -209,19 +209,24 @@ struct Metrics {
     lm: f32,
     rm: f32,
     bw: f32,
+    /// Median font size of body-text rows (0 when the page has too few to tell).
+    body: f32,
 }
 
 fn metrics(rows: &[Row], pw: f32) -> Metrics {
+    let mut sz: Vec<f32> = rows.iter().filter(|r| prose_like(r)).map(|r| r.size).collect();
+    sz.sort_by(f32::total_cmp);
+    let body = if sz.len() >= 3 { sz[sz.len() / 2] } else { 0.0 };
     let mut x0: Vec<f32> = rows.iter().filter(|r| r.words.len() >= 5).map(|r| r.x0).collect();
     let mut x1: Vec<f32> = rows.iter().filter(|r| r.words.len() >= 5).map(|r| r.x1).collect();
     if x0.len() < 4 {
-        return Metrics { lm: pw * 0.1, rm: pw * 0.9, bw: pw * 0.8 };
+        return Metrics { lm: pw * 0.1, rm: pw * 0.9, bw: pw * 0.8, body };
     }
     x0.sort_by(f32::total_cmp);
     x1.sort_by(f32::total_cmp);
     let lm = x0[x0.len() / 5];
     let rm = x1[x1.len() * 4 / 5];
-    Metrics { lm, rm, bw: (rm - lm).max(pw * 0.3) }
+    Metrics { lm, rm, bw: (rm - lm).max(pw * 0.3), body }
 }
 
 // ---- token helpers -----------------------------------------------------------------------
@@ -411,7 +416,7 @@ fn prose_like(r: &Row) -> bool {
 /// that merely share a baseline.
 fn solid_prose(r: &Row, m: &Metrics) -> bool {
     let gap = r.words.windows(2).map(|w| w[1].x0 - w[0].x1).fold(0.0, f32::max);
-    prose_like(r) && r.x1 - r.x0 > 0.6 * m.bw && gap < 2.5 * r.size.max(6.0)
+    prose_like(r) && r.size >= 0.8 * m.body && r.x1 - r.x0 > 0.6 * m.bw && gap < 2.5 * r.size.max(6.0)
 }
 
 fn is_label_row(r: &Row) -> bool {
@@ -558,18 +563,22 @@ fn find_captions(p: &PageIn, rows: &[Row], m: &Metrics, out: &mut Vec<Target>) {
         if r.text.contains('…') {
             continue;
         }
+        // a full-width body-size sentence that merely opens with `Figure 16.2.` is prose, not a caption
+        if m.body > 0.0 && r.size >= 0.97 * m.body && solid_prose(r, m) && r.x1 - r.x0 > 0.9 * m.bw {
+            continue;
+        }
         let starts = i == 0 || gap_above(rows, i) > 0.3 * r.size || r.x0 > rows[i - 1].x0 + 5.0 || rows[i - 1].text.ends_with(['.', ':']) || !prose_like(&rows[i - 1]);
         if !starts {
             continue;
         }
         // caption continues over wrapped lines
         let mut cend = i;
-        while cend + 1 < rows.len() && gap_above(rows, cend + 1) < 0.6 * r.size && !starts_target(&rows[cend + 1]) && prose_like(&rows[cend]) {
+        while cend + 1 < rows.len() && gap_above(rows, cend + 1) < 0.6 * r.size && !starts_target(&rows[cend + 1]) && (cend == i || prose_like(&rows[cend]) || rows[cend].words.len() >= 3) && (rows[cend + 1].size - r.size).abs() < 0.12 * r.size {
             cend += 1;
         }
         let cap_y0 = r.y0;
         let cap_y1 = rows[cend].y1;
-        let cap_h = 0.6 * p.h;
+        let cap_h = if kind == Kind::Table { 0.88 * p.h } else { 0.6 * p.h };
         // region above: images chained to the caption, else back to the previous prose row
         let above = |from: f32| -> f32 {
             let mut top = from;
@@ -587,7 +596,7 @@ fn find_captions(p: &PageIn, rows: &[Row], m: &Metrics, out: &mut Vec<Target>) {
                 return top;
             }
             // never above the running page header
-            let header = rows.iter().take_while(|x| x.y0 < 0.08 * p.h).map(|x| x.y1).fold(0.0, f32::max);
+            let header = rows.iter().take_while(|x| x.y0 < 0.06 * p.h && x.y1 < 0.09 * p.h).map(|x| x.y1).fold(0.0, f32::max);
             let prose_end = rows[..i].iter().rev().find(|x| solid_prose(x, m)).map_or(header, |x| x.y1.max(header));
             prose_end + 3.0
         };
@@ -622,7 +631,7 @@ fn find_captions(p: &PageIn, rows: &[Row], m: &Metrics, out: &mut Vec<Target>) {
             kind,
             label,
             page: p.page,
-            rect: [(x0 - 3.0).max(0.0), y0.max(0.0), (x1 + 3.0).min(p.w), y1.min(p.h)],
+            rect: [(x0 - 6.0).max(0.0), (y0 - 6.0).max(0.0), (x1 + 6.0).min(p.w), (y1 + 4.0).min(p.h)],
             text: truncate(&body.join(" "), 80),
         });
     }
@@ -646,6 +655,10 @@ pub fn extract_page(p: &PageIn) -> (Vec<Target>, Vec<RawRef>) {
     find_captions(p, &rows, &m, &mut targets);
     let mut refs = Vec::new();
     for r in &rows {
+        // running headers / footers (`§21 Connected Subspaces ... 147`) are not references
+        if r.words.len() <= 10 && (r.y1 < 0.085 * p.h || r.y0 > 0.925 * p.h) {
+            continue;
+        }
         refs_in_row(p.page, r, &mut refs);
     }
     (targets, refs)

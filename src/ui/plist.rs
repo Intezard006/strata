@@ -1,6 +1,6 @@
 //! `:previews` — fuzzy-filterable list of all targets grouped by kind.
 
-use super::{fuzzy, panel_bg, pm, sel_bg, Canvas, ACCENT, DIM, FG};
+use super::{panel_bg, pm, sel_bg, Canvas, ACCENT, DIM, FG};
 use crate::previews::{Kind, Target};
 use crate::text::TextRenderer;
 
@@ -59,7 +59,17 @@ impl PList {
 
     /// Filtered target ids in display order.
     pub fn items(&self, targets: &[Target]) -> Vec<u32> {
-        self.all.iter().copied().filter(|&i| fuzzy(&self.query, &haystack(&targets[i as usize]))).collect()
+        let mut v: Vec<u32> = self.all.iter().copied().filter(|&i| super::pick::score(&self.query, &haystack(&targets[i as usize])).is_some()).collect();
+        let q = self.query.trim().to_lowercase();
+        if !q.is_empty() {
+            // exact `figure 6.7` / `6.7` label matches lead their group
+            let exact = |i: &u32| {
+                let t = &targets[*i as usize];
+                q == format!("{} {}", t.kind.name(), t.label).to_lowercase() || q == t.label.to_lowercase()
+            };
+            v.sort_by_key(|i| (targets[*i as usize].kind, !exact(i)));
+        }
+        v
     }
 
     pub fn rows(&self, targets: &[Target]) -> (Vec<Row>, Option<usize>) {

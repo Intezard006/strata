@@ -821,7 +821,7 @@ impl App {
             None => {
                 self.zoom = (vw / self.layout.size(p).0 / self.dpi).clamp(MIN_ZOOM, MAX_ZOOM);
                 self.sy = self.layout.top(p);
-                self.sx = 0.0;
+                self.sx = self.layout.left(p); // the page may be narrower than the widest one: start at its own edge
             }
             Some(r) => {
                 let w = (r[2] - r[0]).max(40.0) + 16.0;
@@ -1693,6 +1693,10 @@ impl App {
         let t = &pv.targets[p.target as usize];
         let (rw, rh) = ((t.rect[2] - t.rect[0]).max(4.0), (t.rect[3] - t.rect[1]).max(4.0));
         let base = (0.6 * self.vp.0 as f32 / rw).min(self.cfg.preview_max_scale * self.dpi);
+        // tall targets shrink to fit the window, but never below 60% of the width-fit scale
+        // (smaller is unreadable); beyond that the popup scrolls
+        let hfit = (0.9 * self.vp.1 as f32 - 74.0 * self.dpi) / rh;
+        let base = base.min(hfit.max(0.6 * base));
         // crisp, but never more than ~6 Mpx however large the region
         let s = (base * p.zoom).min((6.0e6 / (rw * rh)).sqrt()).max(0.2);
         self.popup_seq += 1;
@@ -1796,19 +1800,17 @@ impl App {
                 };
                 let tg = &pv.targets;
                 match token.as_str() {
-                    "<Esc>" => {
-                        if l.query.is_empty() {
-                            self.overlay = Overlay::None;
-                        } else {
-                            l.query.clear();
-                            l.sel = 0;
-                        }
+                    "<Esc>" => self.overlay = Overlay::None,
+                    "<C-u>" => {
+                        l.query.clear();
+                        l.sel = 0;
+                        l.scroll = 0;
                     }
                     "<BS>" => l.backspace(),
                     "<Down>" | "<C-n>" => l.move_sel(1, tg),
                     "<Up>" | "<C-p>" => l.move_sel(-1, tg),
                     "<PgDn>" | "<C-d>" => l.move_sel(10, tg),
-                    "<PgUp>" | "<C-u>" => l.move_sel(-10, tg),
+                    "<PgUp>" => l.move_sel(-10, tg),
                     "<CR>" => {
                         if let Some(id) = l.current(tg) {
                             let t = tg[id as usize].clone();
@@ -1835,18 +1837,13 @@ impl App {
                 }
             }
             Overlay::Pick(pk) => match token.as_str() {
-                "<Esc>" => {
-                    if pk.query.is_empty() {
-                        self.overlay = Overlay::None;
-                    } else {
-                        pk.clear_query();
-                    }
-                }
+                "<Esc>" => self.overlay = Overlay::None,
+                "<C-u>" => pk.clear_query(),
                 "<BS>" => pk.backspace(),
                 "<Down>" | "<C-n>" => pk.move_sel(1),
                 "<Up>" | "<C-p>" => pk.move_sel(-1),
                 "<PgDn>" | "<C-d>" => pk.move_sel(10),
-                "<PgUp>" | "<C-u>" => pk.move_sel(-10),
+                "<PgUp>" => pk.move_sel(-10),
                 "<CR>" => {
                     let act = pk.current().map(|i| i.act.clone());
                     self.overlay = Overlay::None; // drops the item list
@@ -1869,13 +1866,8 @@ impl App {
             Overlay::Help(h) => {
                 let rows = self.help_rows as i32;
                 match token.as_str() {
-                    "<Esc>" | "<F1>" => {
-                        if h.query.is_empty() || token == "<F1>" {
-                            self.overlay = Overlay::None;
-                        } else {
-                            h.query.clear();
-                        }
-                    }
+                    "<Esc>" | "<F1>" => self.overlay = Overlay::None,
+                    "<C-u>" if !h.query.is_empty() => h.query.clear(),
                     "<BS>" => h.backspace(),
                     "<Down>" => h.scroll_by(1, self.help_rows),
                     "<Up>" => h.scroll_by(-1, self.help_rows),

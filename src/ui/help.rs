@@ -1,6 +1,6 @@
 //! Help overlay generated from the keymap and command registry.
 
-use super::{fuzzy, panel_bg, pm, Canvas, ACCENT, DIM, FG};
+use super::{panel_bg, pm, Canvas, ACCENT, DIM, FG};
 use crate::config::OPTIONS;
 use crate::keys::{Keymap, Mode, COMMANDS};
 use crate::text::TextRenderer;
@@ -50,7 +50,7 @@ impl Help {
         for l in &self.lines {
             match l {
                 Line::Header(_) => header = Some(l),
-                Line::Item { left, right } if fuzzy(&self.query, &format!("{left} {right}")) => {
+                Line::Item { left, right } if super::pick::score(&self.query, &format!("{left} {right}")).is_some() => {
                     if let Some(h) = header.take() {
                         out.push(h);
                     }

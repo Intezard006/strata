@@ -86,17 +86,11 @@ pub const ERR: [u8; 3] = [0xf3, 0x8b, 0xa8];
 pub const ACCENT: [u8; 3] = [0x89, 0xb4, 0xfa];
 
 pub fn panel_bg() -> u32 {
-    pm([0x11, 0x11, 0x1b], 0xf0)
+    pm([0x1d, 0x1d, 0x2d], 0xff)
 }
 
 pub fn sel_bg() -> u32 {
     pm([0x45, 0x47, 0x5a], 0xe0)
-}
-
-/// Fuzzy subsequence match, case-insensitive; empty needle matches everything.
-pub fn fuzzy(needle: &str, hay: &str) -> bool {
-    let mut it = hay.chars().flat_map(|c| c.to_lowercase());
-    needle.chars().flat_map(|c| c.to_lowercase()).filter(|c| !c.is_whitespace()).all(|n| it.any(|h| h == n))
 }
 
 #[cfg(test)]
@@ -122,13 +116,4 @@ mod tests {
         cv.blit(3, 3, &src, 10, 10, 4, false);
     }
 
-    #[test]
-    fn fuzzy_filter() {
-        assert!(fuzzy("", "anything"));
-        assert!(fuzzy("scdn", "scroll-down"));
-        assert!(fuzzy("ZOOM", "Zoom in"));
-        assert!(fuzzy("zo in", "zoom in"));
-        assert!(!fuzzy("zx", "zoom"));
-        assert!(!fuzzy("nz", "zn"));
-    }
 }
