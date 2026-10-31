@@ -1,6 +1,6 @@
 //! Renderer thread (owns the MuPDF document) and the byte-capped tile cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -49,11 +49,16 @@ pub struct TileCache {
     bytes: usize,
     cap: usize,
     tick: u64,
+    /// Tiles currently on screen, per view (main, float): never evicted, even above the cap.
+    pinned: [HashSet<TileKey>; 2],
+    /// Tiles evicted or refused since the pinned set last changed: not requested again until it does,
+    /// so a cap smaller than the wanted set cannot cause a render/evict loop.
+    denied: HashSet<TileKey>,
 }
 
 impl TileCache {
     pub fn new(cap: usize) -> Self {
-        TileCache { map: HashMap::new(), bytes: 0, cap, tick: 0 }
+        TileCache { map: HashMap::new(), bytes: 0, cap, tick: 0, pinned: Default::default(), denied: HashSet::new() }
     }
 
     pub fn bytes(&self) -> usize {
@@ -78,18 +83,49 @@ impl TileCache {
         })
     }
 
+    /// Declare the tiles `view` (0 main, 1 float) shows. A change forgives earlier denials.
+    pub fn set_pinned(&mut self, view: usize, keys: &[TileKey]) {
+        if self.pinned[view].len() != keys.len() || !keys.iter().all(|k| self.pinned[view].contains(k)) {
+            self.pinned[view] = keys.iter().copied().collect();
+            self.denied.clear();
+        }
+    }
+
+    fn is_pinned(&self, k: &TileKey) -> bool {
+        self.pinned[0].contains(k) || self.pinned[1].contains(k)
+    }
+
+    /// Whether paint should (re)request `k`: not cached, and not already evicted/refused for this view.
+    pub fn wants(&self, k: &TileKey) -> bool {
+        !self.map.contains_key(k) && (self.is_pinned(k) || !self.denied.contains(k))
+    }
+
     pub fn insert(&mut self, k: TileKey, tile: Tile) {
         self.tick += 1;
         self.bytes += tile.bytes();
         if let Some((old, _)) = self.map.insert(k, (tile, self.tick)) {
             self.bytes -= old.bytes();
         }
-        while self.bytes > self.cap && self.map.len() > 1 {
-            let victim = self.map.iter().filter(|(kk, _)| **kk != k).min_by_key(|(_, e)| e.1).map(|(kk, _)| *kk);
+        while self.bytes > self.cap {
+            // oldest tile that is not on screen; a neighbour that does not fit is dropped itself
+            let victim = self.map.iter().filter(|(kk, _)| **kk != k && !self.is_pinned(kk)).min_by_key(|(_, e)| e.1).map(|(kk, _)| *kk);
             match victim {
-                Some(v) => self.bytes -= self.map.remove(&v).unwrap().0.bytes(),
-                None => break,
+                Some(v) => {
+                    self.bytes -= self.map.remove(&v).unwrap().0.bytes();
+                    self.denied.insert(v);
+                }
+                None => {
+                    if !self.is_pinned(&k) {
+                        // prefetch is best-effort: it must fit after the on-screen set
+                        self.bytes -= self.map.remove(&k).unwrap().0.bytes();
+                        self.denied.insert(k);
+                    }
+                    break;
+                }
             }
+        }
+        if self.denied.len() > 8192 {
+            self.denied.clear();
         }
     }
 
@@ -733,15 +769,58 @@ mod tests {
     #[test]
     fn big_tile_evicts_several_and_survives() {
         let mut c = TileCache::new(1000);
+        c.set_pinned(0, &[key(9), key(10)]);
         for i in 0..4 {
             c.insert(key(i), tile(200));
         }
         c.insert(key(9), tile(900));
         assert_eq!(c.len(), 1);
         assert!(c.contains(&key(9)));
-        c.insert(key(10), tile(2000)); // oversized: kept alone
+        c.set_pinned(0, &[key(10)]);
+        c.insert(key(10), tile(2000)); // oversized: the pinned set is exempt from the cap, others go
         assert_eq!(c.len(), 1);
         assert_eq!(c.bytes(), 2000);
+    }
+
+    /// The paint loop as the UI runs it: request what the cache wants, deliver, repaint.
+    fn converge(c: &mut TileCache, visible: &[TileKey], neighbours: &[TileKey], size: usize) -> usize {
+        let mut requests = 0;
+        for _round in 0..50 {
+            c.set_pinned(0, visible);
+            let wanted: Vec<TileKey> = visible.iter().chain(neighbours).copied().collect();
+            let todo: Vec<TileKey> = wanted.into_iter().filter(|k| c.wants(k)).collect();
+            if todo.is_empty() {
+                return requests;
+            }
+            for k in todo {
+                requests += 1;
+                c.insert(k, tile(size));
+            }
+        }
+        usize::MAX // never settled
+    }
+
+    #[test]
+    fn cap_below_visible_set_converges_and_keeps_visible() {
+        let mut c = TileCache::new(1000);
+        let vis: Vec<TileKey> = (0..4).map(key).collect();
+        let nb = [key(10), key(11)];
+        let n = converge(&mut c, &vis, &nb, 600); // 4 x 600 > 1000
+        assert!(n <= vis.len() + nb.len(), "bounded requests, got {n}");
+        assert!(vis.iter().all(|k| c.contains(k)), "visible tiles are never evicted");
+        assert!(!c.contains(&key(10)) && !c.contains(&key(11)), "neighbours do not fit and are dropped");
+        // settled: another paint requests nothing
+        assert_eq!(converge(&mut c, &vis, &nb, 600), 0);
+    }
+
+    #[test]
+    fn neighbours_fill_only_the_room_left() {
+        let mut c = TileCache::new(1000);
+        let vis = [key(0), key(1)];
+        let n = converge(&mut c, &vis, &[key(5), key(6)], 300);
+        assert!(n <= 4);
+        assert!(c.contains(&key(5)) != c.contains(&key(6)), "exactly one neighbour fits");
+        assert_eq!(c.bytes(), 900);
     }
 
     #[test]

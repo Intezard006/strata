@@ -2088,6 +2088,8 @@ impl App {
 
         let vis = self.visible_tiles();
         let mut wanted: Vec<TileKey> = vis.iter().map(|p| p.key).collect();
+        let shown = wanted.clone();
+        self.cache.set_pinned(self.in_float as usize, &shown);
         if !self.in_float {
             wanted.extend(self.neighbours(&vis)); // the small float window only keeps what it shows
         }
@@ -2100,7 +2102,7 @@ impl App {
         let gen = self.render.gen.load(Ordering::Relaxed);
         let recolor = self.applied.recolor.with_enabled(self.cfg.recolor.enabled);
         for k in wanted.iter().filter(|_| !self.zoom_hold) {
-            if !self.cache.contains(k) && self.pending.insert(*k) {
+            if self.cache.wants(k) && self.pending.insert(*k) {
                 let _ = self.render.req_tx.send(Cmd::Tile(Request { key: *k, gen, recolor }));
             }
         }
