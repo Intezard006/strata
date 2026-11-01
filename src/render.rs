@@ -278,6 +278,7 @@ pub fn spawn(path: PathBuf, proxy: EventLoopProxy<()>) -> Result<(RenderHandle, 
                 queue: Vec::new(),
                 search: None,
                 page_cache: None,
+                smooth_above: f32::MAX,
                 images: HashMap::new(),
                 imap: i2,
                 tx: resp_tx,
@@ -370,6 +371,9 @@ struct Renderer {
     queue: Vec<Request>,
     search: Option<SearchState>,
     page_cache: Option<(u32, mupdf::Page)>,
+    /// Render scale (px per point) above which some image of the cached page is magnified more than 2x.
+    /// MuPDF scales unflagged images up with nearest-neighbour beyond that, so such tiles flag them first.
+    smooth_above: f32,
     /// Image placements per page (small, capped); the flag says whether darkness was measured.
     images: HashMap<u32, (Vec<ImgRect>, u8)>,
     imap: Arc<Mutex<ImageMap>>,
@@ -385,6 +389,22 @@ impl Renderer {
     fn shrink_store(&self) {
         if let Some(c) = self.ctx {
             unsafe { mupdf_sys::fz_empty_store(c) };
+        }
+    }
+
+    /// Smooth-upscaling threshold of a page (see `smooth_above`).
+    fn smooth_threshold(page: &mupdf::Page, no: u32) -> f32 {
+        imagemap::placements(page, no)
+            .iter()
+            .map(|pl| 2.0 * pl.image.width() as f32 / (pl.rect[2] - pl.rect[0]).max(1.0))
+            .fold(f32::MAX, f32::min)
+    }
+
+    /// Flag the page's image objects for bilinear upscaling. MuPDF shares them through its store, and the
+    /// run that follows picks up the very same objects, so the flag only has to outlive this tile.
+    fn smooth_images(page: &mupdf::Page, no: u32) {
+        for mut pl in imagemap::placements(page, no) {
+            pl.image.set_interpolate(true);
         }
     }
 
@@ -643,6 +663,7 @@ impl Renderer {
                 self.loads = 0;
             }
             self.page_cache = self.doc.load_page(k.page as i32).ok().map(|p| (k.page, p));
+            self.smooth_above = self.page_cache.as_ref().map_or(f32::MAX, |(_, p)| Self::smooth_threshold(p, k.page));
         }
         // A failed render becomes an empty tile so the UI does not re-request it forever.
         let imgs = self.images_for(k.page, &req.recolor);
@@ -651,6 +672,9 @@ impl Renderer {
             .as_ref()
             .and_then(|(_, page)| {
                 let b = page.bounds().ok()?;
+                if k.scale_f() > self.smooth_above {
+                    Self::smooth_images(page, k.page);
+                }
                 render_tile(page, b.x0, b.y0, self.sizes[k.page as usize], k, &req.recolor, &imgs, &self.cs)
             })
             .unwrap_or(Tile { w: 0, h: 0, data: Vec::new() });
