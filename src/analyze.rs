@@ -683,7 +683,7 @@ pub fn dump_recall(args: &[String]) -> ExitCode {
         let have = found.get(k);
         let missing: Vec<(&String, &u32)> = labels.iter().filter(|(l, _)| !have.is_some_and(|h| h.contains(*l))).collect();
         println!("{k}: referenced {} distinct labels, {} found as targets, {} missing", labels.len(), labels.len() - missing.len(), missing.len());
-        let shown: Vec<String> = missing.iter().take(25).map(|(l, p)| format!("{l}@p{p}")).collect();
+        let shown: Vec<String> = missing.iter().take(std::env::var("STRATA_MISSING").ok().and_then(|v| v.parse().ok()).unwrap_or(25)).map(|(l, p)| format!("{l}@p{p}")).collect();
         println!("   missing e.g. {}", shown.join(" "));
     }
     ExitCode::SUCCESS

@@ -284,6 +284,24 @@ pub fn eq_tag(w: &str) -> Option<(String, bool)> {
     (w.contains('.') && plain_label(w).is_some()).then(|| (w.to_string(), false))
 }
 
+/// `(Eq. 6.2)` at the end of a row, as the book labels display equations: (label, words used).
+/// The label is either a separate word pair `(Eq.` `6.2)` or one glued word `(Eq.6.2)`.
+fn eq_kw_tail(words: &[W]) -> Option<(String, usize)> {
+    let is_kw = |s: &str| matches!(s.to_lowercase().trim_end_matches('.'), "(eq" | "(eqn" | "(equation");
+    let last = &words.last()?.t;
+    let inner = last.strip_suffix(')')?;
+    if let Some(i) = inner.find('.').filter(|_| inner.starts_with('(')) {
+        // glued `(Eq.6.2` : keyword part ends at the first dot that follows letters
+        let (kw, rest) = inner.split_at(i + 1);
+        if is_kw(kw) {
+            return any_label(rest).map(|l| (l.to_string(), 1));
+        }
+    }
+    let l = any_label(inner)?;
+    let prev = &words.get(words.len().checked_sub(2)?)?.t;
+    is_kw(prev).then(|| (l.to_string(), 2))
+}
+
 fn kind_for_keyword(k: &str) -> Option<Kind> {
     Some(match k {
         "eq" | "eqs" | "eqn" | "eqns" | "equation" | "equations" => Kind::Equation,
@@ -340,12 +358,18 @@ fn tokens(r: &Row) -> Vec<W> {
 }
 
 fn refs_in_row(page: u32, r: &Row, out: &mut Vec<RawRef>) {
-    let t = tokens(r);
+    let mut t = tokens(r);
+    // the `(Eq. 6.2)` label ending a display line names the equation, it does not refer to it
+    let wide_gap = |k: usize| r.words.len() == k || r.words[r.words.len() - k].x0 - r.words[r.words.len() - k - 1].x1 >= (2.5 * r.size).max(18.0);
+    if let Some((_, k)) = eq_kw_tail(&r.words).filter(|&(_, k)| wide_gap(k)) {
+        let keep = t.len().saturating_sub(k);
+        t.truncate(keep);
+    }
     // a row that opens with `Theorem 13.1.` / `Figure 2` is the target itself, not a reference
     let mut i = if statement_head(r).is_some() || caption_head(r).is_some() { 2 } else { 0 };
     let mut consumed = vec![false; t.len()];
     while i < t.len() {
-        let kw = trim_tail(&t[i].t).to_lowercase();
+        let kw = trim_tail(&t[i].t).trim_start_matches('(').to_lowercase();
         let Some(kind) = kind_for_keyword(&kw).filter(|_| i + 1 < t.len()) else {
             i += 1;
             continue;
@@ -376,7 +400,7 @@ fn refs_in_row(page: u32, r: &Row, out: &mut Vec<RawRef>) {
                 break;
             }
         }
-        i = j.max(i) + 1;
+        i = if first { i + 1 } else { j + 1 };
     }
     // bare "(3.2)" and "by (12)" refer to equations
     for k in 0..t.len() {
@@ -420,7 +444,7 @@ fn solid_prose(r: &Row, m: &Metrics) -> bool {
 }
 
 fn is_label_row(r: &Row) -> bool {
-    r.words.last().is_some_and(|w| eq_tag(&w.t).is_some())
+    eq_kw_tail(&r.words).is_some() || r.words.last().is_some_and(|w| eq_tag(&w.t).is_some())
 }
 
 fn display_like(r: &Row, m: &Metrics) -> bool {
@@ -476,16 +500,19 @@ fn find_equations(p: &PageIn, rows: &[Row], m: &Metrics, out: &mut Vec<Target>) 
     for (i, r) in rows.iter().enumerate() {
         let n = r.words.len();
         let last = &r.words[n - 1];
-        let Some((label, bracketed)) = eq_tag(&last.t) else { continue };
+        // `(Eq. 6.2)` (Anslyn style) or a bare `(6.2)` / `6.2` tag: (label, bracketed, words in the tag)
+        let kw_tag = eq_kw_tail(&r.words);
+        let Some((label, bracketed, k)) = kw_tag.clone().map(|(l, k)| (l, true, k)).or_else(|| eq_tag(&last.t).map(|(l, b)| (l, b, 1))) else { continue };
         if r.text.contains('…') || last.x1 < m.rm - 0.12 * m.bw {
             continue;
         }
-        let gap = if n >= 2 { last.x0 - r.words[n - 2].x1 } else { 1000.0 };
+        let nb = n - k;
+        let gap = if nb >= 1 { r.words[n - k].x0 - r.words[nb - 1].x1 } else { 1000.0 };
         let need = if bracketed { (2.5 * r.size).max(18.0) } else { (4.0 * r.size).max(30.0) };
         if gap < need {
             continue;
         }
-        let before = &r.words[..n - 1];
+        let before = &r.words[..nb];
         // table rows end in numbers too: a bare `4.8` after other numbers is a value, not a tag
         let numeric = |w: &W| w.t.chars().any(|c| c.is_ascii_digit()) && w.t.chars().filter(|c| c.is_alphabetic()).count() <= 1;
         // an unbracketed tag must sit on a line of mathematics, not a table
@@ -498,7 +525,7 @@ fn find_equations(p: &PageIn, rows: &[Row], m: &Metrics, out: &mut Vec<Target>) 
         if starts_target(r) {
             continue;
         }
-        let alone = n == 1;
+        let alone = nb == 0;
         let cap = 0.3 * p.h;
         let (mut top, mut bot) = (i, i);
         while top > 0 && display_like(&rows[top - 1], m) && !is_label_row(&rows[top - 1]) && rows[top].y0 - rows[top - 1].y1 <= 1.6 * r.size && rows[bot].y1 - rows[top - 1].y0 < cap {
@@ -507,18 +534,34 @@ fn find_equations(p: &PageIn, rows: &[Row], m: &Metrics, out: &mut Vec<Target>) 
         while bot + 1 < rows.len() && display_like(&rows[bot + 1], m) && !is_label_row(&rows[bot + 1]) && rows[bot + 1].y0 - rows[bot].y1 <= 1.6 * r.size && rows[bot + 1].y1 - rows[top].y0 < cap {
             bot += 1;
         }
-        if alone && top == bot {
+        let lone = top == bot;
+        if alone && lone && kw_tag.is_none() {
             continue; // a lone number with nothing around it
         }
         let blk = &rows[top..=bot];
         let x0 = blk.iter().map(|r| r.x0).fold(f32::MAX, f32::min);
         let x1 = blk.iter().map(|r| r.x1).fold(0.0, f32::max);
-        let text: Vec<&str> = blk.iter().flat_map(|r| r.words.iter()).filter(|w| !std::ptr::eq(*w, last)).map(|w| w.t.as_str()).collect();
+        let (mut y0, mut y1) = (blk[0].y0, blk[blk.len() - 1].y1);
+        let mut text: Vec<&str> = Vec::new();
+        for (ri, row) in (top..=bot).zip(blk) {
+            let take = if ri == i { nb } else { row.words.len() };
+            text.extend(row.words.iter().take(take).map(|w| w.t.as_str()));
+        }
+        let (mut rx0, mut rx1) = (x0, x1);
+        if alone && lone {
+            // the equation itself is a picture: the free band around its label, between the neighbouring text rows
+            let above = if i > 0 { rows[i - 1].y1 } else { 0.0 };
+            let below = rows.get(i + 1).map_or(p.h, |nx| nx.y0);
+            y0 = above.max(r.y0 - 0.5 * cap).min(r.y0);
+            y1 = below.min(r.y1 + 0.5 * cap).max(r.y1);
+            rx0 = m.lm.min(x0);
+            rx1 = m.rm.max(x1);
+        }
         out.push(Target {
             kind: Kind::Equation,
             label,
             page: p.page,
-            rect: [(x0 - 3.0).max(0.0), (blk[0].y0 - 2.0).max(0.0), (x1 + 3.0).min(p.w), (blk[blk.len() - 1].y1 + 2.0).min(p.h)],
+            rect: [(rx0 - 3.0).max(0.0), (y0 - 2.0).max(0.0), (rx1 + 3.0).min(p.w), (y1 + 2.0).min(p.h)],
             text: truncate(&text.join(" "), 70),
         });
     }
@@ -905,6 +948,44 @@ mod tests {
         assert_eq!(refs("recall §12 and Section 3.2 or Chapter 4"), [(Section, "12".into()), (Section, "3.2".into()), (Chapter, "4".into())]);
         assert_eq!(refs("see § 12 here"), [(Section, "12".into())]);
         assert!(refs("Theorem is great and Table of contents").is_empty());
+        // book style: `Eq. 6.2`, `Eqs. 6.2 and 6.3`, parenthesised
+        assert_eq!(refs("is given in Eq. 6.2 where"), [(Equation, "6.2".into())]);
+        assert_eq!(refs("Combining Eqs. 6.2 and 6.3 we obtain"), [(Equation, "6.2".into()), (Equation, "6.3".into())]);
+        assert_eq!(refs("the Gibbs-Helmholtz equation (Eq. 2.3). Typically"), [(Equation, "2.3".into())]);
+        assert_eq!(refs("a scale of 7 (Eq. 10.4) and (Eq. 10.5)"), [(Equation, "10.4".into())].into_iter().chain([(Equation, "10.5".into())]).collect::<Vec<_>>());
+        assert!(refs("there are 6.2 units in the Equation of state").is_empty(), "no bare numbers");
+    }
+
+    #[test]
+    fn eq_dot_label_rows_are_equation_targets() {
+        // the equation is a picture: the row holds only the right-aligned `(Eq. 6.2)`
+        let mut lines = body(12, &[4, 5, 6, 7]);
+        lines.push(ln_label(160.0, 520.0, "(Eq.", "6.2)", 566.0));
+        let (t, _) = extract_page(&page(lines));
+        let eqs: Vec<&Target> = t.iter().filter(|t| t.kind == Kind::Equation).collect();
+        assert_eq!(eqs.len(), 1, "{eqs:?}");
+        assert_eq!(eqs[0].label, "6.2");
+        assert!(eqs[0].rect[1] < 160.0 && eqs[0].rect[3] > 170.0 && eqs[0].rect[2] - eqs[0].rect[0] > 300.0, "{:?}", eqs[0].rect);
+        // a tag trailing a display line of mathematics: label split from the maths, glued form too
+        for tag in ["(Eq. 6.3)", "(Eq.6.3)"] {
+            let mut lines = body(10, &[4, 5, 6, 7]);
+            let mut r = ln(160.0, 220.0, "K = [A] / [B]");
+            for w in tag.split(' ') {
+                r.words.push(W { t: w.to_string(), x0: 500.0, x1: 566.0 });
+            }
+            lines.push(r);
+            let (t, r) = extract_page(&page(lines));
+            assert!(r.is_empty(), "the closing label names the equation, it is no reference: {r:?}");
+            let e: Vec<&Target> = t.iter().filter(|t| t.kind == Kind::Equation).collect();
+            assert_eq!(e.len(), 1, "{tag}: {e:?}");
+            assert_eq!(e[0].label, "6.3");
+            assert_eq!(e[0].text, "K = [A] / [B]");
+        }
+        // a short prose line that ends with a parenthesised reference, left aligned, is not a target
+        let mut lines = body(10, &[]);
+        lines.push(ln(160.0, 72.0, "as the shift of the (Eq. 6.4)"));
+        let (t, _) = extract_page(&page(lines));
+        assert!(t.iter().all(|t| t.kind != Kind::Equation), "{t:?}");
     }
 
     fn tgt(kind: Kind, label: &str, page: u32) -> Target {
