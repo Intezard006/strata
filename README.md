@@ -32,6 +32,10 @@ page, offset and zoom; a file that does not open yet (half written) keeps the ol
 spread and fit-width / fit-page fit the spread. Links, search hits, previews and SyncTeX all go through the same
 page-to-screen transform, so they stay correct.
 
+`F5` (`:present`) is a presentation: fullscreen, the current page fitted to the screen, no statusbar, only the next
+page prefetched. `j k Space BackSpace` the arrows and a left click move one page; `Esc q F5` end it and restore the
+previous page, offset and zoom exactly. `presentation-bg` sets the surround; recolor and profiles apply as usual.
+
 State (last position, zoom, recolor, bookmarks, marks, jumplist) is stored in `~/.local/share/strata/strata.db` and
 written on close, focus loss, `:open` and SIGTERM/SIGINT; `set restore-position false` turns restoring off.
 

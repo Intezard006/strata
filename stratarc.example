@@ -58,6 +58,10 @@ set auto-reload          true
 set first-page-single    true     # the first page (cover) stands alone
 set book-rtl             false    # right-to-left spreads (manga, Arabic, Hebrew)
 
+# Presentation (F5, :present): fullscreen, one page at fit-page, no statusbar; j k Space BackSpace arrows and
+# left-click change the page by exactly one, Esc q F5 return to the previous page, offset and zoom.
+set presentation-bg      #000000  # rgba(0,0,0,0) lets the desktop show through
+
 # map [mode] KEYS COMMAND     (modes: normal, index)
 map <C-x> goto 1
 # unmap <Space>

@@ -108,6 +108,22 @@ pub struct StartOpts {
     pub page: Option<u32>,
 }
 
+/// View state saved when a presentation starts, restored exactly when it ends.
+struct PresentSaved {
+    sx: f32,
+    sy: f32,
+    zoom: f32,
+    book: bool,
+    /// The window was already fullscreen: leave it so.
+    was_fullscreen: bool,
+}
+
+/// Presentation mode: fullscreen, one page at fit-page, no statusbar.
+struct Present {
+    page: usize,
+    saved: PresentSaved,
+}
+
 struct Placed {
     key: TileKey,
     x: i64,
@@ -170,6 +186,9 @@ pub struct App {
     reload_again: bool,
     /// Book mode: two-page spreads.
     book: bool,
+    present: Option<Present>,
+    /// A presentation just ended: re-apply this view when the window is back to its old size.
+    unpresent: Option<(f32, f32, f32)>,
     /// STRATA_DEBUG only: write the next painted frame here.
     shot: Option<PathBuf>,
     proxy: EventLoopProxy<()>,
@@ -294,6 +313,8 @@ impl App {
             watch: None,
             reload_again: false,
             book: false,
+            present: None,
+            unpresent: None,
             shot: None,
             proxy,
             worker_tx,
@@ -632,7 +653,7 @@ impl App {
     }
 
     fn bar_h(&self) -> i32 {
-        match (&self.text, self.cfg.statusbar && !self.in_float && !self.float_solo) {
+        match (&self.text, self.cfg.statusbar && !self.in_float && !self.float_solo && self.present.is_none()) {
             (Some(t), true) => statusbar::height(t),
             _ => 0,
         }
@@ -690,6 +711,9 @@ impl App {
     }
 
     fn clamp_scroll(&mut self) {
+        if self.present.is_some() {
+            return self.pin_present();
+        }
         let (vw, vh) = self.vp_pt();
         self.sy = self.sy.clamp(0.0, (self.layout.total_h - vh).max(0.0));
         self.sx = self.sx.clamp(0.0, (self.layout.max_w - vw).max(0.0));
@@ -740,8 +764,18 @@ impl App {
         if self.opening.is_some() || self.window.is_none() || self.float_solo {
             return;
         }
-        let (page, y) = self.view_pos();
-        db.save_pos(key, &self.path, &db::Pos { page, y, x: self.sx, zoom: self.zoom, recolor: Some(self.cfg.recolor.enabled) });
+        let (page, y, x, zoom) = match &self.present {
+            // mid-presentation: store the view the presentation started from, not the fitted slide
+            Some(pr) => {
+                let p = self.layout.page_at(pr.saved.sy);
+                (p as u32, pr.saved.sy - self.layout.top(p), pr.saved.sx, pr.saved.zoom)
+            }
+            None => {
+                let (page, y) = self.view_pos();
+                (page, y, self.sx, self.zoom)
+            }
+        };
+        db.save_pos(key, &self.path, &db::Pos { page, y, x, zoom, recolor: Some(self.cfg.recolor.enabled) });
         let (pos, list) = self.jumps.saved();
         db.save_jumps(key, pos, list);
     }
@@ -1234,8 +1268,17 @@ impl App {
                 self.shot = Some(PathBuf::from(line["debug-shot ".len()..].trim()));
                 self.redraw();
             }
+            Ext::Exec(line) if debug() && line.starts_with("debug-key ") => {
+                // developer aid: feed a key token as if typed (the compositor may not deliver real keys)
+                let tok = line["debug-key ".len()..].trim().to_string();
+                let ch = Some(tok.chars().next().filter(|_| tok.chars().count() == 1)).flatten();
+                self.on_key(tok, ch, el);
+            }
+            Ext::Exec(line) if debug() && line.starts_with("debug-click") => {
+                self.mouse_button(MouseButton::Left);
+            }
             Ext::Exec(line) if debug() && line.starts_with("debug-state") => {
-                eprintln!("debug-state: page {} sy {} sx {} zoom {} vp {:?} book {} len {}", self.current_page() + 1, self.sy, self.sx, self.zoom, self.vp, self.book, self.layout.len());
+                eprintln!("debug-state: page {} sy {} sx {} zoom {} vp {:?} book {} len {} present {} tiles {} pending {}", self.current_page() + 1, self.sy, self.sx, self.zoom, self.vp, self.book, self.layout.len(), self.present.is_some(), self.cache.len(), self.pending.len());
             }
             Ext::Exec(line) if debug() && line.starts_with("debug-mem") => {
                 extern "C" {
@@ -1280,6 +1323,7 @@ impl App {
             }
             Ext::Open(p) => self.exec(Command::Open(p.to_string_lossy().into_owned()), None, el),
             Ext::Synctex { input, line, column } => self.synctex_view(&input, line, column),
+            Ext::PinchBegin(_) if self.present.is_some() => {}
             Ext::PinchBegin(surface) => {
                 let float = self.float.as_ref().is_some_and(|f| f.sid == surface);
                 let base = if float { self.float.as_ref().map_or(1.0, |f| f.zoom) } else { self.zoom };
@@ -1341,6 +1385,114 @@ impl App {
                     o => format!("image: {} (override)", o.name()),
                 });
             }
+        }
+    }
+
+    /// Pages to draw for a view `vh` points tall: the visible ones, or the single page of a presentation.
+    fn shown_pages(&self, vh: f32) -> std::ops::RangeInclusive<usize> {
+        match &self.present {
+            Some(p) => p.page..=p.page,
+            None => self.layout.visible(self.sy, self.sy + vh),
+        }
+    }
+
+    // ---- presentation -------------------------------------------------------------------
+
+    /// F5 / `:present`: fullscreen, the current page fitted to the screen, no statusbar; ends the presentation if running.
+    fn toggle_present(&mut self) {
+        if self.present.is_some() {
+            return self.end_present();
+        }
+        let Some(w) = self.window.clone() else { return };
+        if self.float_solo || !matches!(self.overlay, Overlay::None) || self.mode != Mode::Normal {
+            return self.err("Close the overlay first".into());
+        }
+        let saved = PresentSaved { sx: self.sx, sy: self.sy, zoom: self.zoom, book: self.book, was_fullscreen: w.fullscreen().is_some() };
+        let page = self.current_page();
+        self.close_popup();
+        self.hover.cancel();
+        self.message = None;
+        self.highlight = false;
+        self.unpresent = None;
+        if self.book {
+            self.book = false;
+            self.layout = self.make_layout(self.layout.sizes().to_vec());
+        }
+        if !saved.was_fullscreen {
+            w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
+        w.set_cursor_visible(false);
+        self.present = Some(Present { page, saved });
+        self.present_fit();
+    }
+
+    /// Leave the presentation and put page, offset and zoom back exactly as they were.
+    fn end_present(&mut self) {
+        let Some(pr) = self.present.take() else { return };
+        let s = pr.saved;
+        if s.book != self.book {
+            self.book = s.book;
+            self.layout = self.make_layout(self.layout.sizes().to_vec());
+        }
+        (self.zoom, self.sx, self.sy) = (s.zoom, s.sx, s.sy);
+        if let Some(w) = &self.window {
+            w.set_cursor_visible(true);
+            if !s.was_fullscreen {
+                w.set_fullscreen(None);
+                // the window is still screen-sized until the compositor answers: restore again when it has
+                self.unpresent = Some((s.zoom, s.sx, s.sy));
+            }
+        }
+        self.invalidate(false);
+        self.redraw();
+    }
+
+    /// Zoom so the presented page fits the whole window, then centre it.
+    fn present_fit(&mut self) {
+        let Some(page) = self.present.as_ref().map(|p| p.page) else { return };
+        let (w, h) = self.layout.size(page);
+        let z = ((self.vp.0 as f32 / w).min(self.vp.1 as f32 / h) / self.dpi).clamp(MIN_ZOOM, MAX_ZOOM);
+        if (z - self.zoom).abs() > 1e-6 {
+            self.zoom = z;
+            self.invalidate(false);
+        }
+        self.pin_present();
+        self.redraw();
+    }
+
+    /// Scroll so the presented page is centred in the window.
+    fn pin_present(&mut self) {
+        let Some(page) = self.present.as_ref().map(|p| p.page) else { return };
+        let (vw, vh) = self.vp_pt();
+        let (w, h) = self.layout.size(page);
+        self.sy = self.layout.top(page) - (vh - h) / 2.0;
+        self.sx = self.layout.left(page) - (vw - w) / 2.0;
+    }
+
+    /// Move the presentation by `d` pages (exactly one per key press or click).
+    fn present_go(&mut self, d: isize) {
+        let Some(pr) = self.present.as_mut() else { return };
+        let np = (pr.page as isize + d).clamp(0, self.layout.len() as isize - 1) as usize;
+        if np != pr.page {
+            pr.page = np;
+            self.present_fit();
+        }
+    }
+
+    fn mouse_button(&mut self, b: MouseButton) {
+        match b {
+            MouseButton::Left => self.present_go(1),
+            MouseButton::Right => self.present_go(-1),
+            _ => {}
+        }
+    }
+
+    fn present_key(&mut self, token: &str, ch: Option<char>) {
+        match (token, ch) {
+            ("<Esc>" | "<F5>", _) | (_, Some('q')) => self.end_present(),
+            ("<Space>" | "<Down>" | "<Right>" | "<PgDn>", _) | (_, Some('j' | 'J')) => self.present_go(1),
+            ("<BS>" | "<S-Space>" | "<Up>" | "<Left>" | "<PgUp>", _) | (_, Some('k' | 'K')) => self.present_go(-1),
+            _ => {}
         }
     }
 
@@ -1432,6 +1584,10 @@ impl App {
     }
 
     fn goto_page(&mut self, p: usize) {
+        if let Some(pr) = self.present.as_mut() {
+            pr.page = p.min(self.layout.len() - 1);
+            return self.present_fit();
+        }
         self.sy = self.layout.row_top(p.min(self.layout.len() - 1));
         self.clamp_scroll();
     }
@@ -1502,6 +1658,8 @@ impl App {
                 self.sx = self.layout.row_span(p).0;
                 self.clamp_scroll();
             }
+            Command::Book if self.present.is_some() => {}
+            Command::Present => self.toggle_present(),
             Command::Book => self.set_book(!self.book),
             Command::ToggleRecolor => {
                 self.cfg.recolor.enabled = !self.cfg.recolor.enabled;
@@ -1746,7 +1904,7 @@ impl App {
     fn visible_links(&self) -> Vec<(u32, [f32; 4], Target)> {
         let (_, vh) = self.vp_pt();
         let mut out = Vec::new();
-        for p in self.layout.visible(self.sy, self.sy + vh) {
+        for p in self.shown_pages(vh) {
             for l in self.links.get(&(p as u32)).map(|v| v.as_slice()).unwrap_or(&[]) {
                 let (_, py) = self.page_origin(p);
                 let s = self.scale();
@@ -1817,7 +1975,7 @@ impl App {
 
     /// Mouse moved: arm or cancel the hover timer, close a hover popup the mouse left.
     fn update_hover(&mut self) {
-        let active = self.cfg.previews && self.pv.is_some() && matches!(self.overlay, Overlay::None) && self.mode == Mode::Normal;
+        let active = self.cfg.previews && self.pv.is_some() && self.present.is_none() && matches!(self.overlay, Overlay::None) && self.mode == Mode::Normal;
         if !active {
             return;
         }
@@ -1920,7 +2078,7 @@ impl App {
         let s = self.scale();
         let doc_h = self.doc_h() as f32;
         let mut found: Vec<(u32, [f32; 4], u32)> = Vec::new();
-        for p in self.layout.visible(self.sy, self.sy + vh) {
+        for p in self.shown_pages(vh) {
             let (_, py) = self.page_origin(p);
             for r in self.refs_for(p as u32).clone() {
                 let (y0, y1) = (py as f32 + r.rect[1] * s, py as f32 + r.rect[3] * s);
@@ -1965,6 +2123,11 @@ impl App {
     fn on_key(&mut self, token: String, ch: Option<char>, el: &ActiveEventLoop) {
         self.message = None;
         self.flash = None;
+        self.unpresent = None;
+        if self.present.is_some() {
+            self.present_key(&token, ch);
+            return;
+        }
         if let (Some(set), Overlay::None) = (self.mark_prompt.take(), &self.overlay) {
             match ch.filter(|c| c.is_ascii_alphabetic()) {
                 Some(c) => self.exec(Command::Mark(set, c), None, el),
@@ -2251,7 +2414,7 @@ impl App {
         let (_, vh_pt) = self.vp_pt();
         let vh = self.doc_h() as i64;
         let mut out = Vec::new();
-        for p in self.layout.visible(self.sy, self.sy + vh_pt) {
+        for p in self.shown_pages(vh_pt) {
             let (w, h) = page_px(self.layout.size(p), s);
             let (strip, n) = tile_grid(w, h);
             let (px, py) = self.page_origin(p);
@@ -2302,7 +2465,13 @@ impl App {
         let mut wanted: Vec<TileKey> = vis.iter().map(|p| p.key).collect();
         let shown = wanted.clone();
         self.cache.set_pinned(self.in_float as usize, &shown);
-        if !self.in_float {
+        if let Some(pr) = &self.present {
+            // a presentation prefetches the next page only
+            let next = pr.page + 1;
+            if next < self.layout.len() {
+                wanted.extend((0..self.tile_count(next)).map(|t| TileKey { page: next as u32, scale: self.scale_key(), tile: t }));
+            }
+        } else if !self.in_float {
             wanted.extend(self.neighbours(&vis)); // the small float window only keeps what it shows
         }
         if self.in_float {
@@ -2328,7 +2497,7 @@ impl App {
         let doc_h = self.doc_h() as i64;
         let mut hl: Vec<(i32, i32, i32, i32, bool)> = Vec::new();
         if let (true, Some(sr)) = (self.highlight, &self.search) {
-            for p in self.layout.visible(self.sy, self.sy + self.vp_pt().1) {
+            for p in self.shown_pages(self.vp_pt().1) {
                 let (ox, oy) = self.page_origin(p);
                 for hit in sr.on_page(p as u32) {
                     let r = hit.rect;
@@ -2381,9 +2550,9 @@ impl App {
         let index_auto = self.index_auto;
         let search_pos = self.search.as_ref().map(|s| (s.index().map_or(0, |i| i + 1), s.hits.len(), s.done));
         let panel_bg = self.cfg.preview_bg;
-        let bar_visible = self.cfg.statusbar && !self.in_float && !self.float_solo;
+        let bar_visible = self.cfg.statusbar && !self.in_float && !self.float_solo && self.present.is_none();
         let under = !self.cfg.recolor.enabled;
-        let bg = self.bg;
+        let bg = if self.present.is_some() { premultiply(self.cfg.presentation_bg) } else { self.bg };
         let shot = self.shot.take();
 
         let Some(surface) = self.surface.as_mut() else { return };
@@ -2488,7 +2657,7 @@ impl App {
 
     fn request_links(&mut self) {
         let (_, vh) = self.vp_pt();
-        let vis = self.layout.visible(self.sy, self.sy + vh);
+        let vis = self.shown_pages(vh);
         if self.links.len() > 40 {
             let (a, b) = (*vis.start() as i64, *vis.end() as i64);
             self.links.retain(|&p, _| (p as i64) >= a - 10 && (p as i64) <= b + 10);
@@ -2556,6 +2725,7 @@ fn key_input(ev: &KeyEvent, m: &ModifiersState) -> Option<(String, Option<char>)
                 NamedKey::PageUp => "<PgUp>",
                 NamedKey::PageDown => "<PgDn>",
                 NamedKey::F1 => "<F1>",
+                NamedKey::F5 => "<F5>",
                 _ => return None,
             };
             (t.to_string(), if matches!(n, NamedKey::Space) && !ctrl { Some(' ') } else { None })
@@ -2739,6 +2909,14 @@ impl ApplicationHandler<()> for App {
             WindowEvent::RedrawRequested => self.paint(),
             WindowEvent::Resized(sz) => {
                 self.vp = (sz.width, sz.height);
+                if self.present.is_some() {
+                    self.present_fit();
+                } else if let Some((z, x, y)) = self.unpresent.filter(|_| self.window.as_ref().is_some_and(|w| w.fullscreen().is_none())) {
+                    // back to the pre-presentation window size: the saved view, exactly
+                    self.unpresent = None;
+                    (self.zoom, self.sx, self.sy) = (z, x, y);
+                    self.invalidate(false);
+                }
                 self.redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -2758,6 +2936,8 @@ impl ApplicationHandler<()> for App {
                     self.redraw();
                 }
             }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } if self.present.is_some() => self.mouse_button(button),
+            WindowEvent::MouseWheel { .. } if self.present.is_some() => {}
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if matches!(self.overlay, Overlay::None) && self.mode == Mode::Normal {
                     if self.mods.control_key() && self.cfg.synctex {
