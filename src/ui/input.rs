@@ -128,6 +128,13 @@ impl InputBar {
         self.cursor = self.text.len();
     }
 
+    /// Insert pasted text at the cursor, with newlines stripped (the bar is one line).
+    pub fn paste(&mut self, s: &str) {
+        for c in s.chars().filter(|c| !matches!(c, '\n' | '\r')) {
+            self.insert(c);
+        }
+    }
+
     pub fn tab(&mut self) {
         if self.prefix != ':' {
             return;
@@ -141,7 +148,8 @@ impl InputBar {
             let typed = &s[start..];
             let common = common_prefix(&cands);
             let single = cands.len() == 1;
-            let word = if single { format!("{} ", cands[0]) } else if common.len() > typed.len() { common } else { cands[0].clone() };
+            // a path may continue (into a directory), and a trailing space would become part of it
+            let word = if single && is_open_line(&s) { cands[0].clone() } else if single { format!("{} ", cands[0]) } else if common.len() > typed.len() { common } else { cands[0].clone() };
             self.replace_from(start, &word);
             if !single {
                 self.comp = Some(Comp { start, cands, idx: 0 });
@@ -175,6 +183,11 @@ fn common_prefix(c: &[String]) -> String {
 
 /// Candidates for the word being typed in `line` (text before the cursor): (start byte, matches).
 pub fn completions(line: &str) -> (usize, Vec<String>) {
+    if is_open_line(line) {
+        let start = "open ".len();
+        let home = std::env::var("HOME").unwrap_or_default();
+        return (start, path_candidates(&line[start..], &home));
+    }
     let words: Vec<&str> = line.split(' ').collect();
     let start = line.len() - words.last().map_or(0, |w| w.len());
     let cur = words.last().copied().unwrap_or("");
@@ -184,6 +197,38 @@ pub fn completions(line: &str) -> (usize, Vec<String>) {
         _ => Vec::new(),
     };
     (start, names.into_iter().filter(|n| n.starts_with(cur)).map(String::from).collect())
+}
+
+fn is_open_line(line: &str) -> bool {
+    line.starts_with("open ")
+}
+
+/// Paths completing `typed` (the rest of an `:open` line): `~` expands to `home`, directories get a `/`,
+/// dotfiles only show when asked for. Candidates keep the typed directory part, so `~` stays `~`.
+pub fn path_candidates(typed: &str, home: &str) -> Vec<String> {
+    let (dir_typed, name) = typed.rsplit_once('/').map_or(("", typed), |(d, n)| (&typed[..d.len() + 1], n));
+    let real = |p: &str| match p.strip_prefix('~') {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("{home}{rest}"),
+        _ => p.to_string(),
+    };
+    if typed == "~" && !home.is_empty() {
+        return vec!["~/".to_string()];
+    }
+    let dir = if dir_typed.is_empty() { ".".to_string() } else { real(dir_typed) };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if !n.starts_with(name) || (n.starts_with('.') && !name.starts_with('.')) {
+                return None;
+            }
+            let is_dir = e.path().is_dir(); // follows symlinks
+            Some(format!("{dir_typed}{n}{}", if is_dir { "/" } else { "" }))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -239,5 +284,44 @@ mod tests {
         b.tab();
         assert_ne!(first, b.string());
         assert!(completions("goto 5").1.is_empty());
+    }
+
+    #[test]
+    fn paste_strips_newlines() {
+        let mut b = typed("open ab");
+        b.left();
+        b.paste("/x/y\n/z\r\n");
+        assert_eq!(b.string(), "open a/x/y/zb");
+        assert_eq!(b.cursor, "open a/x/y/z".len());
+    }
+
+    #[test]
+    fn path_completion() {
+        let d = std::env::temp_dir().join(format!("strata-pc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("books/sub")).unwrap();
+        std::fs::write(d.join("books/alpha.pdf"), b"").unwrap();
+        std::fs::write(d.join("books/alps.pdf"), b"").unwrap();
+        std::fs::write(d.join("books/.hidden"), b"").unwrap();
+        let home = d.to_str().unwrap();
+        assert_eq!(path_candidates("~/bo", home), ["~/books/"]);
+        assert_eq!(path_candidates("~", home), ["~/"]);
+        assert_eq!(path_candidates("~/books/al", home), ["~/books/alpha.pdf", "~/books/alps.pdf"]);
+        assert_eq!(path_candidates("~/books/s", home), ["~/books/sub/"]);
+        assert_eq!(path_candidates("~/books/", home), ["~/books/alpha.pdf", "~/books/alps.pdf", "~/books/sub/"]);
+        assert_eq!(path_candidates("~/books/.", home), ["~/books/.hidden"]);
+        assert!(path_candidates("~/nope/", home).is_empty());
+        assert_eq!(path_candidates(&format!("{home}/books/su"), "/elsewhere"), [format!("{home}/books/sub/")]);
+        // wired into the bar: a single directory completes without a trailing space; several cycle
+        let (s, c) = completions(&format!("open {home}/bo"));
+        assert_eq!((s, c), (5, vec![format!("{home}/books/")]));
+        let mut b = typed(&format!("open {home}/books/al"));
+        b.tab();
+        assert!(b.string().ends_with("books/alp"));
+        b.tab();
+        assert!(b.string().ends_with("alps.pdf"));
+        b.tab();
+        assert!(b.string().ends_with("alpha.pdf"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

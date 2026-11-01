@@ -2334,6 +2334,12 @@ impl App {
                 changed = true;
             }
             "<Tab>" => bar.tab(),
+            "<C-v>" | "<S-Insert>" | "<MiddlePaste>" => {
+                if let Some(t) = read_clipboard(token == "<MiddlePaste>") {
+                    bar.paste(&t);
+                    changed = true;
+                }
+            }
             _ => {
                 if let Some(c) = ch.filter(|c| !c.is_control()) {
                     bar.insert(c);
@@ -2715,6 +2721,36 @@ fn fallback(cv: &mut Canvas, cache: &TileCache, layout: &Layout, p: &Placed, doc
     }
 }
 
+/// Clipboard (or the primary selection) via `wl-paste`, one blocking read with a 500 ms timeout.
+fn read_clipboard(primary: bool) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("wl-paste");
+    cmd.arg("--no-newline");
+    if primary {
+        cmd.arg("-p");
+    }
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out.by_ref().take(64 * 1024).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        Ok(buf) => {
+            let _ = child.wait();
+            Some(String::from_utf8_lossy(&buf).into_owned()).filter(|s| !s.is_empty())
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
 fn key_input(ev: &KeyEvent, m: &ModifiersState) -> Option<(String, Option<char>)> {
     let (ctrl, shift) = (m.control_key(), m.shift_key());
     Some(match &ev.logical_key {
@@ -2728,6 +2764,7 @@ fn key_input(ev: &KeyEvent, m: &ModifiersState) -> Option<(String, Option<char>)
                 NamedKey::Escape => "<Esc>",
                 NamedKey::Backspace => "<BS>",
                 NamedKey::Delete => "<Del>",
+                NamedKey::Insert if shift => "<S-Insert>",
                 NamedKey::ArrowUp => "<Up>",
                 NamedKey::ArrowDown => "<Down>",
                 NamedKey::ArrowLeft => "<Left>",
@@ -2958,6 +2995,10 @@ impl ApplicationHandler<()> for App {
                         self.click();
                     }
                 }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } if matches!(self.overlay, Overlay::Input(_)) => {
+                self.input_key("<MiddlePaste>", None, el);
+                self.redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some((token, ch)) = key_input(&event, &self.mods) {
