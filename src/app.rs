@@ -51,7 +51,6 @@ fn debug() -> bool {
     *D.get_or_init(|| std::env::var_os("STRATA_DEBUG").is_some())
 }
 
-const WHEEL_PX: f32 = 50.0; // logical px per wheel notch
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 10.0;
 const HIT_COLOR: [u8; 3] = [0xf9, 0xe2, 0xaf];
@@ -1080,17 +1079,14 @@ impl App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    MouseScrollDelta::PixelDelta(p) => (p.x as f32 / (WHEEL_PX * 1.0), p.y as f32 / WHEEL_PX),
-                };
+                let (dx, dy) = self.wheel_notches(delta, 1.0);
                 let ctrl = self.mods.control_key();
                 self.in_float_view(|a| {
                     if ctrl {
                         a.float_fit_off();
-                        a.pinch_zoom(a.zoom * a.zoom_factor(1).powf(dy));
+                        a.pinch_zoom(a.zoom * a.wheel_zoom_factor().powf(dy));
                     } else {
-                        let k = WHEEL_PX * a.dpi;
+                        let k = a.cfg.wheel_step * a.dpi;
                         a.scroll_by(-dx * k, -dy * k);
                     }
                     a.redraw();
@@ -1098,6 +1094,22 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Wheel delta in notches: line deltas as-is, touchpad pixels scaled by `touchpad-scroll-factor`.
+    fn wheel_notches(&self, d: MouseScrollDelta, dpi: f32) -> (f32, f32) {
+        match d {
+            MouseScrollDelta::LineDelta(x, y) => (x, y),
+            MouseScrollDelta::PixelDelta(p) => {
+                let k = self.cfg.touchpad_scroll_factor / (self.cfg.wheel_step * dpi);
+                (p.x as f32 * k, p.y as f32 * k)
+            }
+        }
+    }
+
+    fn wheel_zoom_factor(&self) -> f32 {
+        let s = if self.cfg.wheel_zoom_step > 0.0 { self.cfg.wheel_zoom_step } else { self.cfg.zoom_step };
+        1.0 + s / 100.0
     }
 
     fn float_fit_off(&mut self) {
@@ -2953,15 +2965,12 @@ impl ApplicationHandler<()> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    MouseScrollDelta::PixelDelta(p) => (p.x as f32 / (WHEEL_PX * self.dpi), p.y as f32 / (WHEEL_PX * self.dpi)),
-                };
+                let (dx, dy) = self.wheel_notches(delta, self.dpi);
                 let over_popup = self.popup.as_ref().is_some_and(|p| p.contains(self.cursor.0, self.cursor.1));
                 match &mut self.overlay {
                     _ if over_popup => {
                         if let Some(p) = self.popup.as_mut() {
-                            p.scroll_by((-dy * WHEEL_PX * self.dpi) as i32);
+                            p.scroll_by((-dy * self.cfg.wheel_step * self.dpi) as i32);
                         }
                     }
                     Overlay::List(l) => {
@@ -2974,8 +2983,8 @@ impl ApplicationHandler<()> for App {
                     _ if self.mode == Mode::Index => {
                         if dy > 0.0 { self.index.up((dy * 3.0) as usize) } else { self.index.down((-dy * 3.0) as usize) }
                     }
-                    _ if self.mods.control_key() => self.pinch_zoom(self.zoom * self.zoom_factor(1).powf(dy)),
-                    _ => self.scroll_by(-dx * WHEEL_PX * self.dpi, -dy * WHEEL_PX * self.dpi),
+                    _ if self.mods.control_key() => self.pinch_zoom(self.zoom * self.wheel_zoom_factor().powf(dy)),
+                    _ => self.scroll_by(-dx * self.cfg.wheel_step * self.dpi, -dy * self.cfg.wheel_step * self.dpi),
                 }
                 self.redraw();
             }

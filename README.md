@@ -19,6 +19,8 @@ commands, `#` index, `@` bookmarks, `=` previews, `%` recent). `:goto 120` goes 
 page numbers, `:goto #120` to PDF page 120, `:goto xii` to front matter. `Ctrl-t` cycles look profiles (`normal`,
 `textbook`, or your own `profile NAME OPTION VALUE` lines). `gf` opens a small floating, pinned window with the current
 page (or the preview target) inside the same process; `strata --float FILE --page N` does the same from a script.
+Mouse: `wheel-step` (px per notch), `touchpad-scroll-factor`, `wheel-zoom-step` (Ctrl+wheel; 0 = `zoom-step`).
+
 Images keep their colours in recolor mode (`set recolor-images keep|dim|recolor`).
 In the default `smart` mode each image is classified once (line art is recolored, photos keep their colours) and the
 decision is stored per document in `~/.cache/strata/<key>/images.bin`; a background pass fills in the rest. `gi`

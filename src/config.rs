@@ -11,6 +11,12 @@ pub struct Config {
     pub default_bg: [u8; 4],
     pub recolor: Recolor,
     pub scroll_step: f32,
+    /// Logical pixels per mouse-wheel notch.
+    pub wheel_step: f32,
+    /// Multiplier for touchpad (pixel-delta) scrolling.
+    pub touchpad_scroll_factor: f32,
+    /// Percent per Ctrl+wheel notch; 0 follows `zoom-step`.
+    pub wheel_zoom_step: f32,
     /// Percent per zoom step.
     pub zoom_step: f32,
     pub page_gap: f32,
@@ -89,6 +95,9 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("recolor-invert-dark-images", "Recolor dark page-sized images (covers) with inverted mapping (true/false)"),
     ("scroll-step", "Logical pixels per j/k step"),
     ("zoom-step", "Zoom step in percent"),
+    ("wheel-step", "Logical pixels per mouse-wheel notch"),
+    ("touchpad-scroll-factor", "Multiplier for touchpad scrolling (0.05-20)"),
+    ("wheel-zoom-step", "Ctrl+wheel zoom step in percent per notch (0 = same as zoom-step)"),
     ("page-gap", "Gap between pages in points"),
     ("statusbar", "Show the statusbar (true/false)"),
     ("font", "UI font family (resolved with fc-match)"),
@@ -123,6 +132,9 @@ impl Default for Config {
             recolor: Recolor { light: [0x1e, 0x1e, 0x2e, 0xff], ..Recolor::default() },
             scroll_step: 40.0,
             zoom_step: 10.0,
+            wheel_step: 50.0,
+            touchpad_scroll_factor: 1.0,
+            wheel_zoom_step: 0.0,
             page_gap: 8.0,
             statusbar: true,
             font: "monospace".into(),
@@ -230,6 +242,9 @@ impl Config {
             "recolor-invert-dark-images" => self.recolor.invert_dark = parse_bool(v)?,
             "scroll-step" => self.scroll_step = parse_num(v, 1.0, 2000.0)?,
             "zoom-step" => self.zoom_step = parse_num(v, 1.0, 100.0)?,
+            "wheel-step" => self.wheel_step = parse_num(v, 1.0, 2000.0)?,
+            "touchpad-scroll-factor" => self.touchpad_scroll_factor = parse_num(v, 0.05, 20.0)?,
+            "wheel-zoom-step" => self.wheel_zoom_step = parse_num(v, 0.0, 100.0)?,
             "page-gap" => self.page_gap = parse_num(v, 0.0, 200.0)?,
             "statusbar" => self.statusbar = parse_bool(v)?,
             "font" => self.font = v.to_string(),
@@ -284,6 +299,9 @@ impl Config {
             "recolor-invert-dark-images" => self.recolor.invert_dark.to_string(),
             "scroll-step" => self.scroll_step.to_string(),
             "zoom-step" => self.zoom_step.to_string(),
+            "wheel-step" => self.wheel_step.to_string(),
+            "touchpad-scroll-factor" => self.touchpad_scroll_factor.to_string(),
+            "wheel-zoom-step" => self.wheel_zoom_step.to_string(),
             "page-gap" => self.page_gap.to_string(),
             "statusbar" => self.statusbar.to_string(),
             "font" => self.font.clone(),
@@ -424,6 +442,19 @@ pub fn read(path: &Path, depth: u32, items: &mut Vec<Item>, errors: &mut Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_options() {
+        let mut c = Config::default();
+        assert_eq!((c.wheel_step, c.touchpad_scroll_factor, c.wheel_zoom_step), (50.0, 1.0, 0.0));
+        c.set("wheel-step", "80").unwrap();
+        c.set("touchpad-scroll-factor", "0.5").unwrap();
+        c.set("wheel-zoom-step", "5").unwrap();
+        assert_eq!((c.wheel_step, c.touchpad_scroll_factor, c.wheel_zoom_step), (80.0, 0.5, 5.0));
+        assert!(c.set("wheel-step", "0").is_err());
+        assert!(c.set("touchpad-scroll-factor", "abc").is_err());
+        assert!(c.set("wheel-zoom-step", "101").is_err());
+    }
 
     #[test]
     fn colors() {
