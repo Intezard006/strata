@@ -201,6 +201,8 @@ pub struct App {
     zoom_settle: Option<Instant>,
     /// Running pinch: the zoom it started from and whether it acts on the float window.
     pinch: Option<(f32, bool)>,
+    /// The pinch-gesture thread; stopped and joined before winit drops the display.
+    pinch_thread: Option<crate::pinch::Pinch>,
     float: Option<View>,
     float_fit: bool,
     float_target: Option<(usize, Option<[f32; 4]>)>,
@@ -308,6 +310,7 @@ impl App {
             zoom_hold: false,
             zoom_settle: None,
             pinch: None,
+            pinch_thread: None,
             float: None,
             float_fit: true,
             float_target: None,
@@ -664,6 +667,13 @@ impl App {
     }
 
     /// Write the position and jumplist; called on close, focus loss, `open`, signals and exit.
+    /// Stop helper threads that use winit's wl_display; call before the event loop is dropped.
+    pub fn shutdown(&mut self) {
+        if let Some(mut p) = self.pinch_thread.take() {
+            p.stop();
+        }
+    }
+
     pub fn save_state(&self) {
         if let Ok(mut m) = self.render.images.lock() {
             if m.is_dirty() {
@@ -2449,7 +2459,7 @@ impl ApplicationHandler<()> for App {
         let sz = window.inner_size();
         self.vp = (sz.width, sz.height);
         self.main_sid = surface_id(&*window);
-        crate::pinch::spawn(&*window, self.ext_tx.clone(), self.proxy.clone());
+        self.pinch_thread = crate::pinch::spawn(&*window, self.ext_tx.clone(), self.proxy.clone());
         self.window = Some(window);
         self.applied.font.1 = 0.0; // re-apply font size at the real dpi
         self.apply_config();

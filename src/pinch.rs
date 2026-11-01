@@ -4,6 +4,7 @@
 
 use crate::ext::Ext;
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+use std::os::fd::AsRawFd;
 use std::sync::mpsc::Sender;
 use wayland_backend::sys::client::Backend;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
@@ -26,12 +27,40 @@ impl State {
     }
 }
 
+/// Handle to the gesture thread. `stop` wakes it through an eventfd and joins it, so that it never touches the
+/// wl_display after winit has disconnected it (that read produced "Io error: Cannot allocate memory" at exit).
+pub struct Pinch {
+    efd: i32,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Pinch {
+    pub fn stop(&mut self) {
+        if let Some(t) = self.thread.take() {
+            let one: u64 = 1;
+            unsafe { libc::write(self.efd, &one as *const u64 as *const _, 8) };
+            let _ = t.join();
+            unsafe { libc::close(self.efd) };
+        }
+    }
+}
+
+impl Drop for Pinch {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Start the gesture thread on the display of `window`. Silent when the compositor has no gestures.
-pub fn spawn(window: &impl HasDisplayHandle, tx: Sender<Ext>, proxy: EventLoopProxy<()>) {
-    let Ok(h) = window.display_handle() else { return };
-    let RawDisplayHandle::Wayland(w) = h.as_raw() else { return };
+pub fn spawn(window: &impl HasDisplayHandle, tx: Sender<Ext>, proxy: EventLoopProxy<()>) -> Option<Pinch> {
+    let h = window.display_handle().ok()?;
+    let RawDisplayHandle::Wayland(w) = h.as_raw() else { return None };
     let display = w.display.as_ptr() as usize;
-    let _ = std::thread::Builder::new().name("pinch".into()).stack_size(256 << 10).spawn(move || {
+    let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if efd < 0 {
+        return None;
+    }
+    let thread = std::thread::Builder::new().name("pinch".into()).stack_size(256 << 10).spawn(move || {
         // SAFETY: the pointer is winit's wl_display, alive for the whole process; the foreign backend never closes it.
         let backend = unsafe { Backend::from_foreign_display(display as *mut _) };
         let conn = Connection::from_backend(backend);
@@ -52,8 +81,41 @@ pub fn spawn(window: &impl HasDisplayHandle, tx: Sender<Ext>, proxy: EventLoopPr
             eprintln!("strata: pinch gestures bound");
         }
         let mut st = State { tx, proxy, surface: 0 };
-        while queue.blocking_dispatch(&mut st).is_ok() {}
+        loop {
+            if queue.dispatch_pending(&mut st).is_err() {
+                return;
+            }
+            if conn.flush().is_err() {
+                return;
+            }
+            let Some(guard) = queue.prepare_read() else { continue };
+            let mut fds = [
+                libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: efd, events: libc::POLLIN, revents: 0 },
+            ];
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return;
+            }
+            if fds[1].revents != 0 {
+                return; // guard drops: read cancelled
+            }
+            if fds[0].revents != 0 {
+                match guard.read() {
+                    Err(wayland_backend::client::WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        }
     });
+    match thread {
+        Ok(t) => Some(Pinch { efd, thread: Some(t) }),
+        Err(_) => {
+            unsafe { libc::close(efd) };
+            None
+        }
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
