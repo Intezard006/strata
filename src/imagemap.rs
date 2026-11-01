@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mupdf::{Colorspace, ColorParams, Device, IRect, Image, Matrix, Pixmap};
 
 /// Bump to reclassify every non-overridden image once.
-pub const CLASSIFIER_VERSION: u8 = 1;
+pub const CLASSIFIER_VERSION: u8 = 2;
 
 const MAGIC: &[u8; 4] = b"SIMG";
 const FORMAT: u8 = 1;

@@ -20,8 +20,9 @@ pub enum ImageMode {
 
 /// Near-white: luminance above this (0..1) in a neutral pixel.
 const WHITE_L: f32 = 0.88;
-/// Neutral: saturation (max-min)/max below this.
-const NEUTRAL_SAT: f32 = 0.12;
+/// Neutral: chroma (max-min, 0..255) below this. An absolute measure: HSV-style saturation
+/// (max-min)/max explodes for near-black pixels, where JPEG noise would look "coloured".
+const NEUTRAL_CHROMA: f32 = 30.0;
 
 /// Whether sampled RGB pixels (a thumbnail of an image placement) look like line art: a dominant
 /// near-white background with sparse ink, hues allowed (coloured strokes), or an almost greyscale
@@ -33,9 +34,9 @@ pub fn is_line_art(px: impl Iterator<Item = [u8; 3]>) -> bool {
         n += 1;
         bins[((r >> 5) as usize) << 6 | ((g >> 5) as usize) << 3 | (b >> 5) as usize] += 1;
         let (mx, mn) = (r.max(g).max(b) as f32, r.min(g).min(b) as f32);
-        let sat = if mx == 0.0 { 0.0 } else { (mx - mn) / mx };
+        let chroma = mx - mn;
         let lum = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
-        if sat < NEUTRAL_SAT {
+        if chroma < NEUTRAL_CHROMA {
             neutral += 1;
             if lum > WHITE_L {
                 white += 1;
@@ -113,7 +114,45 @@ impl Default for Recolor {
     }
 }
 
-const SAT_THRESHOLD: u32 = 48;
+/// Chroma (max-min) where a pixel starts / finishes counting as coloured ink; between the two the
+/// neutral and the hue-keeping looks are blended, so anti-aliased edges leave no fringe and JPEG chroma
+/// noise (up to ~30 on dark pixels) is ignored.
+const CHROMA_LO: u32 = 45;
+const CHROMA_HI: u32 = 105;
+/// Lightness (0..255) a kept hue is raised to at least, so it stays readable on a dark page.
+const HUE_MIN_L: f32 = 0.55;
+
+/// Invert HSL lightness keeping hue and saturation: dark blue becomes light blue.
+fn invert_lightness(r: u32, g: u32, b: u32) -> [u32; 3] {
+    let (rf, gf, bf) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let (mx, mn) = (rf.max(gf).max(bf), rf.min(gf).min(bf));
+    let l = (mx + mn) / 2.0;
+    let d = mx - mn;
+    if d <= 0.0 {
+        let v = ((1.0 - l).max(HUE_MIN_L) * 255.0).round() as u32;
+        return [v; 3];
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs()).max(1e-4);
+    let h = if mx == rf { ((gf - bf) / d).rem_euclid(6.0) } else if mx == gf { (bf - rf) / d + 2.0 } else { (rf - gf) / d + 4.0 };
+    let l2 = (1.0 - l).max(HUE_MIN_L);
+    let c = (1.0 - (2.0 * l2 - 1.0).abs()) * s.min(1.0);
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l2 - c / 2.0;
+    let rgb = [r1, g1, b1].map(|v| ((v + m) * 255.0).clamp(0.0, 255.0));
+    // perceived brightness (blue is dark at equal HSL lightness): lift it to a readable floor
+    let lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+    let floor = 100.0;
+    let t = if lum < floor { (floor - lum) / (255.0 - lum) } else { 0.0 };
+    rgb.map(|v| (v + (255.0 - v) * t).round() as u32)
+}
 
 fn mul255(a: u32, b: u32) -> u32 {
     (a * b + 127) / 255
@@ -209,6 +248,11 @@ impl Recolor {
         let un = |c: u8| ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8;
         self.pixel(255 - un(r), 255 - un(g), 255 - un(b), a)
     }
+    #[cfg(test)]
+    fn pixel_neutral_for_test(&self, r: u8, g: u8, b: u8, a: u8) -> u32 {
+        Recolor { keephue: false, ..*self }.pixel(r, g, b, a)
+    }
+
     pub fn with_enabled(mut self, on: bool) -> Self {
         self.enabled = on;
         self
@@ -227,26 +271,37 @@ impl Recolor {
         let (ur, ug, ub) = (un(r), un(g), un(b));
         let lum = (54 * ur + 183 * ug + 19 * ub) >> 8;
         let ink = mul255(a, 255 - lum);
-        if self.keephue {
-            let mx = ur.max(ug).max(ub);
-            let sat = if mx == 0 { 0 } else { (mx - ur.min(ug).min(ub)) * 255 / mx };
-            if sat > SAT_THRESHOLD {
-                let alpha = mul255(a, (255 - lum).max(sat));
-                return pack(ur, ug, ub, alpha);
-            }
-        }
+        let hue = if self.keephue {
+            let chroma = ur.max(ug).max(ub) - ur.min(ug).min(ub);
+            let w = (chroma.saturating_sub(CHROMA_LO) * 256 / (CHROMA_HI - CHROMA_LO)).min(256);
+            (w > 0).then(|| (w, chroma))
+        } else {
+            None
+        };
         let [dr, dg, db] = self.dark.map(|c| c as u32);
         let la = self.light[3] as u32;
-        if la == 0 {
-            return pack(dr, dg, db, ink);
-        }
+        let neutral = if la == 0 {
+            pack(dr, dg, db, ink)
+        } else {
         // blend ink over the (partly transparent) paper colour, premultiplied
         let paper = mul255(a - ink, la);
         let ch = |d: u32, l: u8| mul255(d, ink) + mul255(l as u32, paper);
         let alpha = ink + paper;
         (alpha << 24) | (ch(dr, self.light[0]).min(alpha) << 16) | (ch(dg, self.light[1]).min(alpha) << 8) | ch(db, self.light[2]).min(alpha)
+        };
+        let Some((w, chroma)) = hue else { return neutral };
+        // coloured ink: same hue, lightness inverted; blended with the neutral look by chroma
+        let [hr, hg, hb] = invert_lightness(ur, ug, ub);
+        let coloured = pack(hr, hg, hb, mul255(a, (255 - lum).max((chroma * 255 / CHROMA_HI).min(255))));
+        let mix = |sh: u32| {
+            let (n, c) = ((neutral >> sh) & 0xff, (coloured >> sh) & 0xff);
+            (n * (256 - w) + c * w) >> 8
+        };
+        (mix(24) << 24) | (mix(16).min(mix(24)) << 16) | (mix(8).min(mix(24)) << 8) | mix(0).min(mix(24))
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -293,15 +348,58 @@ mod tests {
         assert!((126..=128).contains(&g));
     }
 
+    fn parts(p: u32) -> (u32, u32, u32, u32) {
+        (p >> 24, (p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff)
+    }
+
     #[test]
-    fn keephue_keeps_colored_ink() {
+    fn keephue_keeps_hue_of_colored_ink_and_lightens_it() {
         let rc = Recolor { keephue: true, ..Recolor::default() };
-        let p = rc.pixel(200, 0, 0, 255); // strong red
-        assert_eq!(p >> 24, 255);
-        assert_eq!((p >> 16) & 0xff, 200);
-        assert_eq!(p & 0xffff, 0);
+        let (a, r, g, b) = parts(rc.pixel(220, 20, 20, 255)); // strong red stays a readable red
+        assert!(a >= 250 && r > 200 && r > 2 * g && r > 2 * b, "{a} {r} {g} {b}");
         // neutral ink still uses the dark colour
         assert_eq!(rc.pixel(0, 0, 0, 255), 0xffff_ffff);
+    }
+
+    #[test]
+    fn dark_blue_becomes_light_blue() {
+        let rc = Recolor { keephue: true, ..Recolor::default() };
+        let (a, r, g, b) = parts(rc.pixel(20, 40, 140, 255));
+        assert_eq!(a, 255);
+        let lum = (54 * r + 183 * g + 19 * b) >> 8;
+        assert!(lum >= 135, "light enough for a dark page: lum {lum}");
+        assert!(b > r + 60 && b > g, "still blue: {r} {g} {b}");
+    }
+
+    #[test]
+    fn dark_tinted_jpeg_text_is_neutral_ink() {
+        let rc = Recolor { keephue: true, ..Recolor::default() };
+        // near-black with a bluish cast has high HSV saturation but tiny chroma: plain white ink
+        assert_eq!(rc.pixel(20, 25, 35, 255), rc.pixel_neutral_for_test(20, 25, 35, 255));
+        let (a, r, g, b) = parts(rc.pixel(20, 25, 35, 255));
+        assert!(a > 200 && r > 200 && g > 200 && b > 200, "{a} {r} {g} {b}");
+    }
+
+    #[test]
+    fn noisy_black_glyph_row_has_no_hollow_core() {
+        let rc = Recolor { keephue: true, ..Recolor::default() };
+        // luminance ramps from white paper into a black stem with JPEG chroma noise on the dark part
+        let row: Vec<u32> = (0..=10)
+            .map(|i| {
+                let v = 255 - i * 25; // 255 .. 5
+                let n = if v < 120 { (i as i32 % 3 - 1) * 12 } else { 0 };
+                let c = |d: i32| (v as i32 + d).clamp(0, 255) as u8;
+                parts(rc.pixel(c(n), c(0), c(-n), 255)).0
+            })
+            .collect();
+        assert!(row.windows(2).all(|w| w[1] + 3 >= w[0]), "alpha must rise into the stem: {row:?}");
+        assert!(row[10] > 230);
+    }
+
+    #[test]
+    fn white_stays_transparent_with_keephue() {
+        let rc = Recolor { keephue: true, ..Recolor::default() };
+        assert_eq!(rc.pixel(255, 255, 255, 255), 0);
     }
 
     #[test]
@@ -422,7 +520,7 @@ mod tests {
         let rc = Recolor::default();
         let p = rc.pixel_hue(220, 20, 20, 255);
         assert!(p >> 24 >= 200, "coloured ink stays strongly opaque");
-        assert!(((p >> 16) & 0xff) > 4 * ((p >> 8) & 0xff), "still red");
+        assert!(((p >> 16) & 0xff) > 2 * ((p >> 8) & 0xff), "still red");
         assert_eq!(rc.pixel_hue(255, 255, 255, 255), 0, "white background becomes transparent");
     }
 
