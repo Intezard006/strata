@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mupdf::{Colorspace, ColorParams, Device, IRect, Image, Matrix, Pixmap};
 
 /// Bump to reclassify every non-overridden image once.
-pub const CLASSIFIER_VERSION: u8 = 2;
+pub const CLASSIFIER_VERSION: u8 = 3;
 
 const MAGIC: &[u8; 4] = b"SIMG";
 const FORMAT: u8 = 1;
@@ -406,16 +406,30 @@ pub fn classify(img: &Image, cs: &Colorspace) -> Class {
     }
     {
         let Ok(dev) = Device::from_pixmap(&pix) else { return Class::Photo };
-        if dev.fill_image(img, &Matrix::new(pw as f32, 0.0, 0.0, ph as f32, 0.0, 0.0), 1.0, ColorParams::default()).is_err() {
+        let m = Matrix::new(pw as f32, 0.0, 0.0, ph as f32, 0.0, 0.0);
+        // a soft mask (logos with a transparent surround) must apply, or the hidden pixels behind it are judged
+        let mask = img.mask();
+        if mask.as_ref().is_some_and(|k| dev.clip_image_mask(k, &m).is_err()) {
+            return Class::Photo;
+        }
+        let ok = dev.fill_image(img, &m, 1.0, ColorParams::default()).is_ok();
+        if mask.is_some() {
+            let _ = dev.pop_clip();
+        }
+        if !ok {
             return Class::Photo;
         }
     }
     let n = pix.n() as usize;
     let (stride, sm) = (pix.stride() as usize, pix.samples());
-    let line = crate::recolor::is_line_art((0..ph as usize).flat_map(|y| (0..pw as usize).map(move |x| (x, y))).map(|(x, y)| {
+    let st = crate::recolor::line_stats((0..ph as usize).flat_map(|y| (0..pw as usize).map(move |x| (x, y))).map(|(x, y)| {
         let p = &sm[y * stride + x * n..];
         [p[0], p[1], p[2]]
     }));
+    if std::env::var_os("STRATA_DEBUG").is_some() {
+        eprintln!("imagemap: stats {st:?}");
+    }
+    let line = st.is_some_and(|s| s.is_line());
     if line { Class::Line } else { Class::Photo }
 }
 

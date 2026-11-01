@@ -27,7 +27,30 @@ const NEUTRAL_CHROMA: f32 = 30.0;
 /// Whether sampled RGB pixels (a thumbnail of an image placement) look like line art: a dominant
 /// near-white background with sparse ink, hues allowed (coloured strokes), or an almost greyscale
 /// image that is at least half white. Tolerant of JPEG noise through the thresholds.
+#[cfg(test)]
 pub fn is_line_art(px: impl Iterator<Item = [u8; 3]>) -> bool {
+    line_stats(px).is_some_and(|s| s.is_line())
+}
+
+/// Summary of a thumbnail: shares of near-white and neutral pixels, of the 6 busiest colour bins, and the
+/// share of pixels that are neither white nor in those bins.
+#[derive(Clone, Copy, Debug)]
+pub struct LineStats {
+    pub white: f32,
+    pub neutral: f32,
+    pub flat: f32,
+    /// Share of the single most common colour bin, when that bin is bright (a light, off-white background).
+    pub light_bg: f32,
+}
+
+impl LineStats {
+    pub fn is_line(&self) -> bool {
+        let (w, ne, flat) = (self.white, self.neutral, self.flat);
+        w >= 0.65 || (ne >= 0.8 && w >= 0.5) || (w >= 0.35 && flat >= 0.85) || (self.light_bg >= 0.35 && flat >= 0.9)
+    }
+}
+
+pub fn line_stats(px: impl Iterator<Item = [u8; 3]>) -> Option<LineStats> {
     let (mut n, mut white, mut neutral) = (0u32, 0u32, 0u32);
     let mut bins = [0u32; 512];
     for [r, g, b] in px {
@@ -46,13 +69,16 @@ pub fn is_line_art(px: impl Iterator<Item = [u8; 3]>) -> bool {
         }
     }
     if n == 0 {
-        return false;
+        return None;
     }
     let (w, ne) = (white as f32 / n as f32, neutral as f32 / n as f32);
     // flat-colour graphics (logos): a mostly white image whose pixels sit in a handful of colours
+    // the busiest bin is a light background when all three channels are in the top three eighths (>= 192)
+    let (top_i, &top_n) = bins.iter().enumerate().max_by_key(|(_, &c)| c).unwrap();
+    let light_bg = if (top_i >> 6) >= 6 && ((top_i >> 3) & 7) >= 6 && (top_i & 7) >= 6 { top_n as f32 / n as f32 } else { 0.0 };
     bins.sort_unstable_by(|a, b| b.cmp(a));
     let flat = bins[..6].iter().sum::<u32>() as f32 / n as f32;
-    w >= 0.65 || (ne >= 0.8 && w >= 0.5) || (w >= 0.35 && flat >= 0.85)
+    Some(LineStats { white: w, neutral: ne, flat, light_bg })
 }
 
 /// Images covering more than this share of the page are scans and are always recolored.
@@ -537,6 +563,30 @@ mod tests {
         assert!(is_line_art(logo.into_iter()));
         let dark: Vec<[u8; 3]> = (0..4000).map(|i| [30, 40 + noise(i) as u8, 60]).collect();
         assert!(!is_line_art(dark.into_iter()));
+    }
+
+    #[test]
+    fn logos_on_an_off_white_background_are_line_art() {
+        // IISER-style logo: red emblem, black ring and text on a light grey-white (not above the white threshold)
+        let logo: Vec<[u8; 3]> = (0..4000)
+            .map(|i| match i % 20 {
+                0..=9 => [(214 + noise(i)) as u8; 3],
+                10..=13 => [215, 215, 218],
+                14..=16 => [200, 25, 30],
+                17 => [15, 15, 15],
+                18 => [140, 20, 25],
+                _ => [214, 214, 214],
+            })
+            .collect();
+        assert!(is_line_art(logo.into_iter()));
+        // a soft-masked logo composited on white: mostly white, three flat colours
+        let masked: Vec<[u8; 3]> = (0..4000).map(|i| match i % 20 { 0..=9 => [255; 3], 10..=14 => [255; 3], 15..=17 => [210, 10, 20], _ => [0; 3] }).collect();
+        assert!(is_line_art(masked.into_iter()));
+        // a bright but continuous-tone photo (e.g. a sky and a vial) is still a photo
+        let photo: Vec<[u8; 3]> = (0..4000).map(|i| if i % 3 == 0 { [(200 + i % 50) as u8, (205 + (i * 3) % 50) as u8, (210 + (i * 7) % 45) as u8] } else { [(i % 256) as u8, ((i * 5) % 256) as u8, ((i * 11) % 200) as u8] }).collect();
+        assert!(!is_line_art(photo.into_iter()));
+        let vial: Vec<[u8; 3]> = (0..4000).map(|i| match i % 8 { 0..=2 => [245, 240, 235], 3 | 4 => [(220 + i % 30) as u8, (190 + i % 40) as u8, (30 + i % 60) as u8], _ => [(100 + i % 120) as u8, (80 + (i * 3) % 120) as u8, (40 + (i * 7) % 150) as u8] }).collect();
+        assert!(!is_line_art(vial.into_iter()));
     }
 
     #[test]
