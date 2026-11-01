@@ -94,6 +94,8 @@ pub enum RegionKind {
     LineArt,
     /// Recolor the inverted pixels (a dark image: dark stays background, light becomes ink).
     Invert,
+    /// A scan (or an image recolored like text): normal recolor plus the contrast curve.
+    Ink,
 }
 
 /// A pixel rectangle inside a tile with its own treatment.
@@ -132,11 +134,15 @@ pub struct Recolor {
     pub keephue: bool,
     /// Paper colour; alpha 0 leaves the page transparent so the window background shows.
     pub light: [u8; 4],
+    /// Ink contrast curve for scans and line art (1 = off): partial ink is pushed towards solid.
+    pub contrast: f32,
+    /// Apply the contrast curve to vector content (text, drawings) too.
+    pub contrast_vector: bool,
 }
 
 impl Default for Recolor {
     fn default() -> Self {
-        Recolor { enabled: true, dark: [0xff, 0xff, 0xff], keephue: false, light: [0; 4], images: ImageMode::Smart, image_dim: 0.85, invert_dark: false }
+        Recolor { enabled: true, dark: [0xff, 0xff, 0xff], keephue: false, light: [0; 4], images: ImageMode::Smart, image_dim: 0.85, invert_dark: false, contrast: 1.0, contrast_vector: false }
     }
 }
 
@@ -189,6 +195,16 @@ fn pack(r: u32, g: u32, b: u32, a: u32) -> u32 {
     (a << 24) | (mul255(r, a) << 16) | (mul255(g, a) << 8) | mul255(b, a)
 }
 
+/// Ink contrast curve on 0..255 coverage: `x(1+k)/(1+kx)` with `k = contrast - 1`. It fixes 0 and 255 and is
+/// monotonic, so anti-aliasing ramps stay ramps, but mid greys of blurry scans are lifted towards solid.
+pub fn ink_curve(x: u32, contrast: f32) -> u32 {
+    let kq = ((contrast - 1.0).max(0.0) * 256.0) as u32;
+    if kq == 0 || x == 0 || x >= 255 {
+        return x.min(255);
+    }
+    (x * (256 + kq) / (256 + kq * x / 255)).min(255)
+}
+
 impl Recolor {
     /// Whether image placements matter (and so must be collected) for this recolor.
     pub fn wants_images(&self) -> bool {
@@ -217,7 +233,7 @@ impl Recolor {
             } else if im.dark && self.invert_dark && scan {
                 RegionKind::Invert
             } else if scan || self.images == ImageMode::Recolor {
-                continue;
+                if self.contrast > 1.0 && !self.contrast_vector { RegionKind::Ink } else { continue }
             } else if self.images == ImageMode::Smart && im.line {
                 RegionKind::LineArt
             } else {
@@ -251,6 +267,7 @@ impl Recolor {
                 Some(RegionKind::Keep) => self.keep_pixel(p[0], p[1], p[2], p[3]),
                 Some(RegionKind::LineArt) => self.pixel_hue(p[0], p[1], p[2], p[3]),
                 Some(RegionKind::Invert) => self.inverted_pixel(p[0], p[1], p[2], p[3]),
+                Some(RegionKind::Ink) => self.pixel_scan(p[0], p[1], p[2], p[3]),
             });
         }
     }
@@ -264,7 +281,7 @@ impl Recolor {
 
     /// Like `pixel`, but strongly coloured ink keeps its hue whatever the `keephue` option says.
     pub fn pixel_hue(&self, r: u8, g: u8, b: u8, a: u8) -> u32 {
-        Recolor { keephue: true, ..*self }.pixel(r, g, b, a)
+        Recolor { keephue: true, ..*self }.pixel_c(r, g, b, a, self.contrast)
     }
 
     pub fn inverted_pixel(&self, r: u8, g: u8, b: u8, a: u8) -> u32 {
@@ -272,7 +289,7 @@ impl Recolor {
             return 0;
         }
         let un = |c: u8| ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8;
-        self.pixel(255 - un(r), 255 - un(g), 255 - un(b), a)
+        self.pixel_c(255 - un(r), 255 - un(g), 255 - un(b), a, self.contrast)
     }
     #[cfg(test)]
     fn pixel_neutral_for_test(&self, r: u8, g: u8, b: u8, a: u8) -> u32 {
@@ -286,6 +303,15 @@ impl Recolor {
 
     /// Convert one premultiplied RGBA pixel (as produced by MuPDF) to premultiplied 0xAARRGGBB.
     pub fn pixel(&self, r: u8, g: u8, b: u8, a: u8) -> u32 {
+        self.pixel_c(r, g, b, a, if self.contrast_vector { self.contrast } else { 1.0 })
+    }
+
+    /// Scans and image regions: `pixel` with the contrast curve always applied.
+    pub fn pixel_scan(&self, r: u8, g: u8, b: u8, a: u8) -> u32 {
+        self.pixel_c(r, g, b, a, self.contrast)
+    }
+
+    fn pixel_c(&self, r: u8, g: u8, b: u8, a: u8, contrast: f32) -> u32 {
         if a == 0 {
             return 0;
         }
@@ -296,7 +322,8 @@ impl Recolor {
         let un = |c: u32| ((c * 255 + a / 2) / a).min(255);
         let (ur, ug, ub) = (un(r), un(g), un(b));
         let lum = (54 * ur + 183 * ug + 19 * ub) >> 8;
-        let ink = mul255(a, 255 - lum);
+        let inkl = ink_curve(255 - lum, contrast);
+        let ink = mul255(a, inkl);
         let hue = if self.keephue {
             let chroma = ur.max(ug).max(ub) - ur.min(ug).min(ub);
             let w = (chroma.saturating_sub(CHROMA_LO) * 256 / (CHROMA_HI - CHROMA_LO)).min(256);
@@ -318,7 +345,7 @@ impl Recolor {
         let Some((w, chroma)) = hue else { return neutral };
         // coloured ink: same hue, lightness inverted; blended with the neutral look by chroma
         let [hr, hg, hb] = invert_lightness(ur, ug, ub);
-        let coloured = pack(hr, hg, hb, mul255(a, (255 - lum).max((chroma * 255 / CHROMA_HI).min(255))));
+        let coloured = pack(hr, hg, hb, mul255(a, inkl.max((chroma * 255 / CHROMA_HI).min(255))));
         let mix = |sh: u32| {
             let (n, c) = ((neutral >> sh) & 0xff, (coloured >> sh) & 0xff);
             (n * (256 - w) + c * w) >> 8
@@ -332,6 +359,39 @@ impl Recolor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contrast_curve() {
+        for c in [1.0, 2.0, 3.5] {
+            assert_eq!((ink_curve(0, c), ink_curve(255, c)), (0, 255));
+            let mut prev = 0;
+            for x in 0..=255 {
+                let y = ink_curve(x, c);
+                assert!(y >= prev, "monotonic at {x} for {c}");
+                prev = y;
+            }
+        }
+        assert_eq!(ink_curve(100, 1.0), 100); // off
+        assert!(ink_curve(100, 2.5) > 150); // mid grey lifted
+        assert!(ink_curve(10, 2.5) < 30); // faint noise stays faint
+        assert!(ink_curve(128, 3.0) > ink_curve(128, 2.0));
+    }
+
+    #[test]
+    fn contrast_applies_to_scans_not_vector_by_default() {
+        let rc = Recolor { contrast: 2.5, ..Recolor::default() };
+        let grey = (0x80, 0x80, 0x80, 255);
+        let plain = rc.pixel(grey.0, grey.1, grey.2, grey.3) >> 24;
+        let scan = rc.pixel_scan(grey.0, grey.1, grey.2, grey.3) >> 24;
+        assert!(scan > plain + 40, "{scan} vs {plain}");
+        let rv = Recolor { contrast_vector: true, ..rc };
+        assert_eq!(rv.pixel(grey.0, grey.1, grey.2, grey.3) >> 24, scan);
+        // scan pages get an Ink region only when the curve is on and not already global
+        let img = [ImgRect { rect: [0.0, 0.0, 100.0, 100.0], dark: false, line: false, id: 1, ovr: crate::imagemap::Ovr::Auto }];
+        assert_eq!(rc.regions(&img, 10000.0, 1.0, (0, 0), (100, 100))[0].kind, RegionKind::Ink);
+        assert!(rv.regions(&img, 10000.0, 1.0, (0, 0), (100, 100)).is_empty());
+        assert!(Recolor::default().regions(&img, 10000.0, 1.0, (0, 0), (100, 100)).is_empty());
+    }
 
     #[test]
     fn transparent_stays_transparent() {

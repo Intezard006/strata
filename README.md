@@ -19,6 +19,8 @@ commands, `#` index, `@` bookmarks, `=` previews, `%` recent). `:goto 120` goes 
 page numbers, `:goto #120` to PDF page 120, `:goto xii` to front matter. `Ctrl-t` cycles look profiles (`normal`,
 `textbook`, or your own `profile NAME OPTION VALUE` lines). `gf` opens a small floating, pinned window with the current
 page (or the preview target) inside the same process; `strata --float FILE --page N` does the same from a script.
+Blurry scans: `recolor-contrast` (default 2.5, 1 = off) lifts grey ink towards solid for scans and line art (`recolor-contrast-vector true` for vector text too). Low-resolution images are upscaled smoothly when zoomed far in.
+
 Mouse: `wheel-step` (px per notch), `touchpad-scroll-factor`, `wheel-zoom-step` (Ctrl+wheel; 0 = `zoom-step`).
 
 Images keep their colours in recolor mode (`set recolor-images keep|dim|recolor`).

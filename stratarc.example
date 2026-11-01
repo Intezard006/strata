@@ -31,6 +31,8 @@ set auto-index           auto     # auto: only when the file has no outline | al
 # Images: keep original colours (photos stay readable); scans (page-sized images) are always recolored
 set recolor-images       keep     # keep | dim | recolor
 set recolor-image-dim    0.85
+set recolor-contrast     2.5      # ink contrast for scans and line art: 1 = off; higher = solid grey ink, AA kept
+set recolor-contrast-vector false # also apply it to vector text and drawings
 set recolor-invert-dark-images false  # recolor dark page-sized images (covers) with an inverted mapping
 set goto-printed         true     # :goto 120 means printed page 120 when the book has page numbers
 

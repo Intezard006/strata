@@ -91,6 +91,8 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("recolor-darkcolor", "Ink colour"),
     ("recolor-keephue", "Keep the hue of coloured ink (true/false)"),
     ("recolor-images", "Images when recoloring: smart (line art recolored, photos kept), keep, dim, recolor"),
+    ("recolor-contrast", "Ink contrast curve for scans and line art (1 = off; higher makes grey ink solid)"),
+    ("recolor-contrast-vector", "Apply recolor-contrast to vector text and drawings too (true/false)"),
     ("recolor-image-dim", "Brightness of dimmed images (0.2-1)"),
     ("recolor-invert-dark-images", "Recolor dark page-sized images (covers) with inverted mapping (true/false)"),
     ("scroll-step", "Logical pixels per j/k step"),
@@ -129,7 +131,7 @@ impl Default for Config {
             cache_mb: 40,
             cache_max_mb: 2048,
             default_bg: [0x1e, 0x1e, 0x2e, 0x99],
-            recolor: Recolor { light: [0x1e, 0x1e, 0x2e, 0xff], ..Recolor::default() },
+            recolor: Recolor { light: [0x1e, 0x1e, 0x2e, 0xff], contrast: 2.5, ..Recolor::default() },
             scroll_step: 40.0,
             zoom_step: 10.0,
             wheel_step: 50.0,
@@ -238,6 +240,8 @@ impl Config {
                     _ => return Err(format!("recolor-images: expected smart|keep|dim|recolor, got {v}")),
                 }
             }
+            "recolor-contrast" => self.recolor.contrast = parse_num(v, 1.0, 6.0)?,
+            "recolor-contrast-vector" => self.recolor.contrast_vector = parse_bool(v)?,
             "recolor-image-dim" => self.recolor.image_dim = parse_num(v, 0.2, 1.0)?,
             "recolor-invert-dark-images" => self.recolor.invert_dark = parse_bool(v)?,
             "scroll-step" => self.scroll_step = parse_num(v, 1.0, 2000.0)?,
@@ -295,6 +299,8 @@ impl Config {
             "recolor-darkcolor" => fmt_color([self.recolor.dark[0], self.recolor.dark[1], self.recolor.dark[2], 255]),
             "recolor-keephue" => self.recolor.keephue.to_string(),
             "recolor-images" => format!("{:?}", self.recolor.images).to_lowercase(),
+            "recolor-contrast" => self.recolor.contrast.to_string(),
+            "recolor-contrast-vector" => self.recolor.contrast_vector.to_string(),
             "recolor-image-dim" => self.recolor.image_dim.to_string(),
             "recolor-invert-dark-images" => self.recolor.invert_dark.to_string(),
             "scroll-step" => self.scroll_step.to_string(),
@@ -442,6 +448,18 @@ pub fn read(path: &Path, depth: u32, items: &mut Vec<Item>, errors: &mut Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contrast_options() {
+        let mut c = Config::default();
+        assert_eq!((c.recolor.contrast, c.recolor.contrast_vector), (2.5, false));
+        c.set("recolor-contrast", "3").unwrap();
+        c.set("recolor-contrast-vector", "true").unwrap();
+        assert_eq!((c.recolor.contrast, c.recolor.contrast_vector), (3.0, true));
+        assert_eq!(c.get("recolor-contrast").as_deref(), Some("3"));
+        assert!(c.set("recolor-contrast", "0.5").is_err());
+        assert!(c.set("recolor-contrast", "x").is_err());
+    }
 
     #[test]
     fn wheel_options() {
