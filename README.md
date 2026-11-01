@@ -28,6 +28,10 @@ override is stored in the same file and survives reclassification.
 With `auto-reload` (default on) the file is reloaded in place when it changes on disk (a `latexmk` build), keeping
 page, offset and zoom; a file that does not open yet (half written) keeps the old view. `:reload` does it by hand.
 
+`d` (`:book`) toggles book mode: two-page spreads with the cover alone (`first-page-single`, `book-rtl`); `J`/`K` move by
+spread and fit-width / fit-page fit the spread. Links, search hits, previews and SyncTeX all go through the same
+page-to-screen transform, so they stay correct.
+
 State (last position, zoom, recolor, bookmarks, marks, jumplist) is stored in `~/.local/share/strata/strata.db` and
 written on close, focus loss, `:open` and SIGTERM/SIGINT; `set restore-position false` turns restoring off.
 

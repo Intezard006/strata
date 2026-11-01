@@ -54,6 +54,10 @@ set synctex              true
 # An inotify watch on the directory, read by a thread that blocks; off means no thread and no fd.
 set auto-reload          true
 
+# Book mode (d, :book): two-page spreads; J/K move by spread, fit-width/fit-page fit the spread.
+set first-page-single    true     # the first page (cover) stands alone
+set book-rtl             false    # right-to-left spreads (manga, Arabic, Hebrew)
+
 # map [mode] KEYS COMMAND     (modes: normal, index)
 map <C-x> goto 1
 # unmap <Space>

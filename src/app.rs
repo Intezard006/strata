@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 use crate::cache::{self, Analysis, OcrState};
 use crate::config::{self, premultiply, AutoIndex, Config};
 use crate::keys::{self, Command, KeyState, Keymap, Mode};
-use crate::layout::{page_px, tile_grid, Layout};
+use crate::layout::{page_px, tile_grid, Book, Layout};
 use crate::links::{hint_labels, open_external, Jumplist, LinkInfo, Target, HINT_ALPHABET};
 use crate::recolor::Recolor;
 use crate::previews::{Kind, Ref};
@@ -120,6 +120,8 @@ struct Applied {
     gap: f32,
     font: (String, f32),
     auto_index: AutoIndex,
+    /// first-page-single and book-rtl as the layout was built.
+    book: (bool, bool),
 }
 
 pub struct App {
@@ -256,7 +258,7 @@ impl App {
             layout: Layout::new(sizes, cfg.page_gap),
             path,
             name,
-            applied: Applied { recolor: cfg.effective_recolor(), gap: cfg.page_gap, font: (String::new(), 0.0), auto_index: cfg.auto_index },
+            applied: Applied { recolor: cfg.effective_recolor(), gap: cfg.page_gap, font: (String::new(), 0.0), auto_index: cfg.auto_index, book: (cfg.first_page_single, cfg.book_rtl) },
             bg: premultiply(cfg.default_bg),
             cache: TileCache::new(cfg.cache_mb << 20),
             cfg,
@@ -421,6 +423,11 @@ impl App {
             let cur = self.current_page();
             self.layout = self.make_layout(self.layout.sizes().to_vec());
             self.goto_page(cur);
+        }
+        if self.book && self.applied.book != (self.cfg.first_page_single, self.cfg.book_rtl) {
+            let p = self.rebuild_layout();
+            self.goto_page(p);
+            self.invalidate(false);
         }
         let font = (self.cfg.font.clone(), self.cfg.font_size * self.dpi);
         if font != self.applied.font {
@@ -648,7 +655,38 @@ impl App {
     }
 
     fn make_layout(&self, sizes: Vec<(f32, f32)>) -> Layout {
-        Layout::new(sizes, self.cfg.page_gap)
+        if self.book {
+            Layout::book(sizes, self.cfg.page_gap, Book { first_single: self.cfg.first_page_single, rtl: self.cfg.book_rtl })
+        } else {
+            Layout::new(sizes, self.cfg.page_gap)
+        }
+    }
+
+    /// Switch between single pages and spreads, keeping the page in view and fitting its width.
+    fn set_book(&mut self, on: bool) {
+        self.book = on;
+        let page = self.rebuild_layout();
+        self.exec_fit_width(page);
+        self.invalidate(true);
+        self.msg(if on { "Book mode".into() } else { "Single pages".into() });
+    }
+
+    /// Lay the pages out again (book mode or its options changed); returns the page that stays in view.
+    fn rebuild_layout(&mut self) -> usize {
+        self.applied.book = (self.cfg.first_page_single, self.cfg.book_rtl);
+        let (page, y) = self.view_pos();
+        let page = (page as usize).min(self.layout.len().saturating_sub(1));
+        self.layout = self.make_layout(self.layout.sizes().to_vec());
+        self.sy = self.layout.top(page) + y;
+        self.clamp_scroll();
+        page
+    }
+
+    fn exec_fit_width(&mut self, p: usize) {
+        self.set_zoom(self.vp.0 as f32 / self.layout.row_size(p).0 / self.dpi);
+        self.goto_page(p);
+        self.sx = self.layout.row_span(p).0;
+        self.clamp_scroll();
     }
 
     fn clamp_scroll(&mut self) {
@@ -1140,8 +1178,7 @@ impl App {
             return;
         }
         let (xp, yp) = (self.x0() + mx / s, self.sy + my / s);
-        let p = self.layout.page_at(yp);
-        let (lx, ly) = (xp - self.layout.left(p), yp - self.layout.top(p));
+        let (p, lx, ly) = self.page_point(xp, yp);
         match synctex::edit(&self.path, p as u32, lx, ly) {
             Err(e) => self.err(e),
             Ok(ed) => {
@@ -1286,8 +1323,8 @@ impl App {
         let (mx, my) = (self.cursor.0 as f32, self.cursor.1 as f32);
         let cursor = (mx >= 0.0 && my >= 0.0 && my < self.doc_h() as f32 && mx < self.vp.0 as f32).then(|| {
             let (xp, yp) = (x0 + mx / s, self.sy + my / s);
-            let p = self.layout.page_at(yp);
-            (p as u32, xp - self.layout.left(p), yp - self.layout.top(p))
+            let (p, lx, ly) = self.page_point(xp, yp);
+            (p as u32, lx, ly)
         });
         let _ = self.render.req_tx.send(Cmd::ToggleImage(ImagePick { recolor: self.cfg.effective_recolor(), pages, cursor }));
     }
@@ -1305,6 +1342,13 @@ impl App {
                 });
             }
         }
+    }
+
+    /// The page under the content point (`xp`, `yp`) and the point in that page's own coordinates: the one
+    /// transform every hit test (links, previews, synctex, images) goes through.
+    fn page_point(&self, xp: f32, yp: f32) -> (usize, f32, f32) {
+        let p = self.layout.page_at_xy(xp, yp);
+        (p, xp - self.layout.left(p), yp - self.layout.top(p))
     }
 
     fn current_page(&self) -> usize {
@@ -1388,7 +1432,7 @@ impl App {
     }
 
     fn goto_page(&mut self, p: usize) {
-        self.sy = self.layout.top(p.min(self.layout.len() - 1));
+        self.sy = self.layout.row_top(p.min(self.layout.len() - 1));
         self.clamp_scroll();
     }
 
@@ -1430,8 +1474,8 @@ impl App {
             Command::ScrollRight => self.scroll_by(step, 0.0),
             Command::HalfPageDown => self.scroll_by(0.0, self.doc_h() as f32 / 2.0 * n as f32),
             Command::HalfPageUp => self.scroll_by(0.0, -(self.doc_h() as f32) / 2.0 * n as f32),
-            Command::NextPage => self.goto_page((self.current_page() + n as usize).min(self.layout.len() - 1)),
-            Command::PrevPage => self.goto_page(self.current_page().saturating_sub(n as usize)),
+            Command::NextPage => self.goto_page(self.layout.step(self.current_page(), n as isize)),
+            Command::PrevPage => self.goto_page(self.layout.step(self.current_page(), -(n as isize))),
             Command::FirstPage | Command::LastPage if count.is_some() => self.goto_arg(crate::pages::GotoArg::Number(n)),
             Command::FirstPage => self.goto_page(0),
             Command::LastPage => self.goto_page(self.layout.len() - 1),
@@ -1445,15 +1489,20 @@ impl App {
             Command::Zoom(pct) => self.set_zoom(pct / 100.0),
             Command::FitWidth => {
                 let p = self.current_page();
-                self.set_zoom(self.vp.0 as f32 / self.layout.size(p).0 / self.dpi);
+                self.set_zoom(self.vp.0 as f32 / self.layout.row_size(p).0 / self.dpi);
                 self.goto_page(p);
+                self.sx = self.layout.row_span(p).0; // the spread may be narrower than the widest one: start at its edge
+                self.clamp_scroll();
             }
             Command::FitPage => {
                 let p = self.current_page();
-                let (w, h) = self.layout.size(p);
+                let (w, h) = self.layout.row_size(p);
                 self.set_zoom((self.vp.0 as f32 / w).min(self.doc_h() as f32 / h) / self.dpi);
                 self.goto_page(p);
+                self.sx = self.layout.row_span(p).0;
+                self.clamp_scroll();
             }
+            Command::Book => self.set_book(!self.book),
             Command::ToggleRecolor => {
                 self.cfg.recolor.enabled = !self.cfg.recolor.enabled;
                 self.apply_config();
@@ -1732,8 +1781,7 @@ impl App {
             return;
         }
         let (xp, yp) = (self.x0() + mx / s, self.sy + my / s);
-        let p = self.layout.page_at(yp);
-        let (lx, ly) = (xp - self.layout.left(p), yp - self.layout.top(p));
+        let (p, lx, ly) = self.page_point(xp, yp);
         let hit = self.links.get(&(p as u32)).and_then(|ls| {
             ls.iter().find(|l| lx >= l.rect[0] && lx <= l.rect[2] && ly >= l.rect[1] && ly <= l.rect[3]).map(|l| l.target.clone())
         });
@@ -1762,8 +1810,7 @@ impl App {
             return None;
         }
         let (xp, yp) = (self.x0() + mx / s, self.sy + my / s);
-        let p = self.layout.page_at(yp);
-        let (lx, ly) = (xp - self.layout.left(p), yp - self.layout.top(p));
+        let (p, lx, ly) = self.page_point(xp, yp);
         let page = p as u32;
         self.refs_for(page).iter().enumerate().find(|(_, r)| lx >= r.rect[0] - 1.0 && lx <= r.rect[2] + 1.0 && ly >= r.rect[1] - 1.0 && ly <= r.rect[3] + 1.0).map(|(i, r)| (page, i, *r))
     }

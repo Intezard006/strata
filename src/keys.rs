@@ -47,6 +47,8 @@ pub enum Command {
     FitWidth,
     FitPage,
     ToggleRecolor,
+    /// Two-page spreads on or off.
+    Book,
     /// Cycle the recolor/keep override of the image under the cursor (or the largest on screen).
     ImageToggle,
     ToggleStatusbar,
@@ -130,6 +132,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("fit-width", "", "Fit page width"),
     ("fit-page", "", "Fit whole page"),
     ("toggle-recolor", "", "Toggle recolor"),
+    ("book", "", "Toggle book mode: two-page spreads (options first-page-single, book-rtl); J/K move by spread"),
     ("image-toggle", "", "Cycle the image under the cursor (else the largest on screen) through keep / recolor / auto; saved per document"),
     ("toggle-statusbar", "", "Show or hide the statusbar"),
     ("quit", "", "Quit"),
@@ -231,6 +234,7 @@ pub fn parse_words(name: &str, args: &[String]) -> Result<Command, String> {
         "fit-width" => FitWidth,
         "fit-page" => FitPage,
         "toggle-recolor" => ToggleRecolor,
+        "book" => Book,
         "image-toggle" => ImageToggle,
         "toggle-statusbar" => ToggleStatusbar,
         "quit" | "q" => Quit,
@@ -355,6 +359,7 @@ const DEFAULTS: &[(Mode, &str, &str)] = &[
     (Mode::Normal, "s", "fit-width"),
     (Mode::Normal, "a", "fit-page"),
     (Mode::Normal, "<C-r>", "toggle-recolor"),
+    (Mode::Normal, "d", "book"),
     (Mode::Normal, "<C-n>", "toggle-statusbar"),
     (Mode::Normal, ":", "command-mode"),
     (Mode::Normal, "/", "search-forward"),
