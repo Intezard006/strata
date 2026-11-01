@@ -561,7 +561,7 @@ mod tests {
         assert!(!is_line_art(cut.into_iter()));
         let logo: Vec<[u8; 3]> = (0..4000).map(|i| match i % 10 { 0..=3 => [255, 255, 255], 4..=6 => [200, 30, 40], 7 => [20, 20, 20], 8 => [120, 20, 30], _ => [255, 255, 255] }).collect();
         assert!(is_line_art(logo.into_iter()));
-        let dark: Vec<[u8; 3]> = (0..4000).map(|i| [30, 40 + noise(i) as u8, 60]).collect();
+        let dark: Vec<[u8; 3]> = (0..4000).map(|i| [30, (40 + noise(i)) as u8, 60]).collect();
         assert!(!is_line_art(dark.into_iter()));
     }
 
