@@ -30,6 +30,8 @@ pub enum Ext {
     PinchBegin(usize),
     PinchUpdate(f64),
     PinchEnd,
+    /// The open file was written or replaced on disk (auto-reload).
+    FileChanged,
 }
 
 /// What the D-Bus properties report; updated by the app when the page or file changes.

@@ -50,6 +50,10 @@ set restore-position     true     # reopen at the last page, zoom and recolor st
 set synctex              true
 # set synctex-editor-command "nvim --server /tmp/vimtexserver.pipe --remote-expr \"vimtex#view#inverse_search(%{line}, '%{input}')\""
 
+# Auto-reload: reload when the file is rewritten on disk (LaTeX builds), keeping page, offset and zoom.
+# An inotify watch on the directory, read by a thread that blocks; off means no thread and no fd.
+set auto-reload          true
+
 # map [mode] KEYS COMMAND     (modes: normal, index)
 map <C-x> goto 1
 # unmap <Space>

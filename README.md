@@ -25,6 +25,9 @@ decision is stored per document in `~/.cache/strata/<key>/images.bin`; a backgro
 (`:image-toggle`) cycles the image under the cursor, or the largest one on screen, through keep / recolor / auto; the
 override is stored in the same file and survives reclassification.
 
+With `auto-reload` (default on) the file is reloaded in place when it changes on disk (a `latexmk` build), keeping
+page, offset and zoom; a file that does not open yet (half written) keeps the old view. `:reload` does it by hand.
+
 State (last position, zoom, recolor, bookmarks, marks, jumplist) is stored in `~/.local/share/strata/strata.db` and
 written on close, focus loss, `:open` and SIGTERM/SIGINT; `set restore-position false` turns restoring off.
 

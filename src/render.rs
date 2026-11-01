@@ -454,13 +454,14 @@ impl Renderer {
                 self.send(Response::Links { page: p, links });
             }
             Cmd::Open(path) => {
-                self.search = None;
-                self.queue.clear();
-                self.page_cache = None;
-                self.images.clear();
-                self.flush_images();
+                // open first: a file that fails to open (half written, unreadable) leaves the current view intact
                 match open(&path) {
                     Ok((doc, sizes)) => {
+                        self.search = None;
+                        self.queue.clear();
+                        self.page_cache = None;
+                        self.images.clear();
+                        self.flush_images();
                         if let Ok(mut m) = self.imap.lock() {
                             *m = load_image_map(&path);
                         }

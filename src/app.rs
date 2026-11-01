@@ -161,7 +161,15 @@ pub struct App {
     pre_search_sy: f32,
     jumps: Jumplist,
     /// Set while an `open` is in flight: the new path, and the scroll to keep on reload.
-    opening: Option<(PathBuf, Option<f32>)>,
+    opening: Option<(PathBuf, Option<(u32, f32)>)>,
+    /// The inotify watch for auto-reload, and the file it watches.
+    watch: Option<(PathBuf, crate::watch::Watch)>,
+    /// A change arrived while a reload was in flight: reload once more when it lands.
+    reload_again: bool,
+    /// Book mode: two-page spreads.
+    book: bool,
+    /// STRATA_DEBUG only: write the next painted frame here.
+    shot: Option<PathBuf>,
     proxy: EventLoopProxy<()>,
     worker_tx: Sender<(u64, Msg)>,
     worker_rx: Receiver<(u64, Msg)>,
@@ -281,6 +289,10 @@ impl App {
             pre_search_sy: 0.0,
             jumps: Jumplist::default(),
             opening: None,
+            watch: None,
+            reload_again: false,
+            book: false,
+            shot: None,
             proxy,
             worker_tx,
             worker_rx,
@@ -407,7 +419,7 @@ impl App {
         if (self.cfg.page_gap - self.applied.gap).abs() > f32::EPSILON {
             self.applied.gap = self.cfg.page_gap;
             let cur = self.current_page();
-            self.layout = Layout::new(self.layout.sizes().to_vec(), self.cfg.page_gap);
+            self.layout = self.make_layout(self.layout.sizes().to_vec());
             self.goto_page(cur);
         }
         let font = (self.cfg.font.clone(), self.cfg.font_size * self.dpi);
@@ -426,6 +438,7 @@ impl App {
             self.applied.auto_index = self.cfg.auto_index;
             self.refresh_index();
         }
+        self.sync_watch();
         self.clamp_scroll();
         self.redraw();
     }
@@ -634,6 +647,10 @@ impl App {
         if mw <= vw { -(vw - mw) / 2.0 } else { self.sx.clamp(0.0, mw - vw) }
     }
 
+    fn make_layout(&self, sizes: Vec<(f32, f32)>) -> Layout {
+        Layout::new(sizes, self.cfg.page_gap)
+    }
+
     fn clamp_scroll(&mut self) {
         let (vw, vh) = self.vp_pt();
         self.sy = self.sy.clamp(0.0, (self.layout.total_h - vh).max(0.0));
@@ -672,6 +689,7 @@ impl App {
         if let Some(mut p) = self.pinch_thread.take() {
             p.stop();
         }
+        self.watch = None;
     }
 
     pub fn save_state(&self) {
@@ -1140,9 +1158,48 @@ impl App {
         self.redraw();
     }
 
+    /// Reopen the current file in place: the renderer keeps the old document unless the new one opens, and
+    /// `on_opened` restores page, offset and zoom.
+    fn start_reload(&mut self) {
+        if self.opening.is_some() {
+            self.reload_again = true;
+            return;
+        }
+        self.opening = Some((self.path.clone(), Some(self.view_pos())));
+        let _ = self.render.req_tx.send(Cmd::Open(self.path.clone()));
+    }
+
+    /// Start or stop the auto-reload watch to match the option and the open file.
+    fn sync_watch(&mut self) {
+        let want = self.cfg.auto_reload && !self.float_solo && self.window.is_some();
+        if let Some((p, _)) = &self.watch {
+            if want && *p == self.path {
+                return;
+            }
+        }
+        self.watch = None; // Drop stops the thread and closes the inotify fd
+        if want {
+            if let Some(w) = crate::watch::Watch::spawn(&self.path, self.ext_tx.clone(), self.proxy.clone()) {
+                self.watch = Some((self.path.clone(), w));
+            }
+        }
+    }
+
     fn on_ext(&mut self, e: Ext, el: &ActiveEventLoop) {
         match e {
+            Ext::FileChanged => {
+                if self.cfg.auto_reload {
+                    self.start_reload();
+                }
+            }
             Ext::Signal => el.exit(),
+            Ext::Exec(line) if debug() && line.starts_with("debug-shot ") => {
+                self.shot = Some(PathBuf::from(line["debug-shot ".len()..].trim()));
+                self.redraw();
+            }
+            Ext::Exec(line) if debug() && line.starts_with("debug-state") => {
+                eprintln!("debug-state: page {} sy {} sx {} zoom {} vp {:?} book {} len {}", self.current_page() + 1, self.sy, self.sx, self.zoom, self.vp, self.book, self.layout.len());
+            }
             Ext::Exec(line) if debug() && line.starts_with("debug-mem") => {
                 extern "C" {
                     fn malloc_info(o: i32, f: *mut std::ffi::c_void) -> i32;
@@ -1526,12 +1583,10 @@ impl App {
                 self.save_state();
                 self.msg(format!("Opening {p}..."));
                 self.opening = Some((path.clone(), None));
+                self.reload_again = false;
                 let _ = self.render.req_tx.send(Cmd::Open(path));
             }
-            Command::Reload => {
-                self.opening = Some((self.path.clone(), Some(self.sy)));
-                let _ = self.render.req_tx.send(Cmd::Open(self.path.clone()));
-            }
+            Command::Reload => self.start_reload(),
             Command::Ocr => {
                 self.start_analysis(true, false);
                 if self.job.is_some() {
@@ -2074,18 +2129,25 @@ impl App {
 
     fn on_opened(&mut self, r: Result<Vec<(f32, f32)>, String>) {
         let pending = self.opening.take();
+        let again = std::mem::take(&mut self.reload_again);
         match r {
-            Err(e) => self.err(e),
+            Err(e) => {
+                // a failed reload leaves the old document and view alone (the renderer did not touch them)
+                if pending.as_ref().is_some_and(|p| p.1.is_some()) {
+                    self.err(format!("Reload failed, keeping the old view: {e}"));
+                } else {
+                    self.err(e);
+                }
+            }
             Ok(sizes) => {
                 let keep = pending.as_ref().and_then(|p| p.1);
                 if let Some((path, _)) = pending {
                     self.name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     self.path = path;
                 }
-                if keep.is_none() {
-                    self.refresh_key();
-                }
-                self.layout = Layout::new(sizes, self.cfg.page_gap);
+                // a new content key: the old analysis, previews and image decisions belong to the old file
+                self.refresh_key();
+                self.layout = self.make_layout(sizes);
                 self.links.clear();
                 self.links_pending.clear();
                 self.search = None;
@@ -2096,10 +2158,22 @@ impl App {
                 self.auto_items.clear();
                 self.outline_items.clear();
                 self.index = Index::default();
+                self.pv = None;
+                self.pv_refs.clear();
+                self.popup = None;
+                self.hover.cancel();
                 self.invalidate(true);
-                self.sx = 0.0;
-                self.sy = keep.unwrap_or(0.0);
                 self.title_page = usize::MAX;
+                match keep {
+                    Some((page, y)) => {
+                        // same page, same offset in it, same zoom and horizontal scroll
+                        self.sy = self.scroll_for(page.min(self.layout.len() as u32 - 1), y);
+                    }
+                    None => {
+                        self.sx = 0.0;
+                        self.sy = 0.0;
+                    }
+                }
                 self.clamp_scroll();
                 self.start_analysis(false, false);
                 if keep.is_none() {
@@ -2114,7 +2188,11 @@ impl App {
                     self.msg("Reloaded".into());
                 }
                 self.sync_info();
+                self.sync_watch();
             }
+        }
+        if again {
+            self.start_reload();
         }
     }
 
@@ -2259,6 +2337,7 @@ impl App {
         let bar_visible = self.cfg.statusbar && !self.in_float && !self.float_solo;
         let under = !self.cfg.recolor.enabled;
         let bg = self.bg;
+        let shot = self.shot.take();
 
         let Some(surface) = self.surface.as_mut() else { return };
         if surface.resize(w, h).is_err() {
@@ -2332,6 +2411,12 @@ impl App {
                 cv.fill_rect(x, y + 3, cw, t.line_h, pm(FG, 0xa0));
                 t.draw(&mut cv, x, y + 3, &after, FG, full_w);
             }
+        }
+        if let Some(path) = shot {
+            // developer aid (STRATA_DEBUG): the frame as a PPM, premultiplied colours over black
+            let mut out = format!("P6\n{} {}\n255\n", size.width, size.height).into_bytes();
+            out.extend(buf.iter().flat_map(|px| [(px >> 16) as u8, (px >> 8) as u8, *px as u8]));
+            let _ = std::fs::write(path, out);
         }
         let _ = window.pre_present_notify();
         let _ = buf.present();
@@ -2461,6 +2546,7 @@ impl ApplicationHandler<()> for App {
         self.main_sid = surface_id(&*window);
         self.pinch_thread = crate::pinch::spawn(&*window, self.ext_tx.clone(), self.proxy.clone());
         self.window = Some(window);
+        self.sync_watch();
         self.applied.font.1 = 0.0; // re-apply font size at the real dpi
         self.apply_config();
         if self.float_solo {

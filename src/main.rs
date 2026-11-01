@@ -21,6 +21,7 @@ mod synctex;
 mod text;
 mod toc;
 mod ui;
+mod watch;
 mod worker;
 
 use std::path::PathBuf;

@@ -32,6 +32,10 @@ pub struct Config {
     pub float_position: String,
     pub synctex: bool,
     pub synctex_editor_command: String,
+    pub auto_reload: bool,
+    pub first_page_single: bool,
+    pub book_rtl: bool,
+    pub presentation_bg: [u8; 4],
 }
 
 /// A look profile: option overrides applied on top of the base config.
@@ -104,6 +108,10 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("float-position", "Float window position: top-right, top-left, bottom-right, bottom-left, center"),
     ("synctex", "SyncTeX forward/backward search (true/false)"),
     ("synctex-editor-command", "Run on Ctrl+click; %{input} %{line} %{column} are substituted (quote the value)"),
+    ("auto-reload", "Reload the file when it changes on disk, keeping page, offset and zoom (true/false)"),
+    ("first-page-single", "Book mode: show the first page alone, as a cover (true/false)"),
+    ("book-rtl", "Book mode: right-to-left spreads (true/false)"),
+    ("presentation-bg", "Presentation mode background (#rrggbbaa or rgba(r,g,b,a); transparent allowed)"),
 ];
 
 impl Default for Config {
@@ -134,6 +142,10 @@ impl Default for Config {
             float_position: "top-right".into(),
             synctex: true,
             synctex_editor_command: String::new(),
+            auto_reload: true,
+            first_page_single: true,
+            book_rtl: false,
+            presentation_bg: [0, 0, 0, 255],
         }
     }
 }
@@ -241,6 +253,10 @@ impl Config {
             }
             "synctex" => self.synctex = parse_bool(v)?,
             "synctex-editor-command" => self.synctex_editor_command = v.to_string(),
+            "auto-reload" => self.auto_reload = parse_bool(v)?,
+            "first-page-single" => self.first_page_single = parse_bool(v)?,
+            "book-rtl" => self.book_rtl = parse_bool(v)?,
+            "presentation-bg" => self.presentation_bg = parse_color(v)?,
             "auto-index" => {
                 self.auto_index = match v {
                     "auto" => AutoIndex::Auto,
@@ -286,6 +302,10 @@ impl Config {
             "float-position" => self.float_position.clone(),
             "synctex" => self.synctex.to_string(),
             "synctex-editor-command" => self.synctex_editor_command.clone(),
+            "auto-reload" => self.auto_reload.to_string(),
+            "first-page-single" => self.first_page_single.to_string(),
+            "book-rtl" => self.book_rtl.to_string(),
+            "presentation-bg" => fmt_color(self.presentation_bg),
             "auto-index" => format!("{:?}", self.auto_index).to_lowercase(),
             _ => return None,
         })
