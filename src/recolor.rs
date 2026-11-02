@@ -18,6 +18,9 @@ pub enum ImageMode {
     Smart,
 }
 
+/// Share of pixels in the 8 busiest colour bins from which a crop counts as a flat-fill graphic.
+pub const FLAT_TOP8: f32 = 0.9;
+
 /// Near-white: luminance above this (0..1) in a neutral pixel.
 const WHITE_L: f32 = 0.88;
 /// Neutral: chroma (max-min, 0..255) below this. An absolute measure: HSV-style saturation
@@ -41,9 +44,23 @@ pub struct LineStats {
     pub flat: f32,
     /// Share of the single most common colour bin, when that bin is bright (a light, off-white background).
     pub light_bg: f32,
+    /// Share of the 8 busiest colour bins: a flat-fill graphic (palette-limited) is near 1, a photograph is not.
+    pub top8: f32,
+    /// Mean luminance, 0..1.
+    pub mean: f32,
 }
 
 impl LineStats {
+    /// Palette-limited: a handful of solid fills (plus anti-aliasing), whatever the amount of white.
+    pub fn is_flat(&self) -> bool {
+        self.top8 >= FLAT_TOP8
+    }
+
+    /// Genuinely photographic: many colours, or dark.
+    pub fn is_photographic(&self) -> bool {
+        self.top8 < 0.85 || self.mean < DARK_MEAN
+    }
+
     pub fn is_line(&self) -> bool {
         let (w, ne, flat) = (self.white, self.neutral, self.flat);
         w >= 0.65 || (ne >= 0.8 && w >= 0.5) || (w >= 0.35 && flat >= 0.85) || (self.light_bg >= 0.35 && flat >= 0.9)
@@ -51,13 +68,14 @@ impl LineStats {
 }
 
 pub fn line_stats(px: impl Iterator<Item = [u8; 3]>) -> Option<LineStats> {
-    let (mut n, mut white, mut neutral) = (0u32, 0u32, 0u32);
+    let (mut n, mut white, mut neutral, mut lsum) = (0u32, 0u32, 0u32, 0u64);
     let mut bins = [0u32; 512];
     for [r, g, b] in px {
         n += 1;
         bins[((r >> 5) as usize) << 6 | ((g >> 5) as usize) << 3 | (b >> 5) as usize] += 1;
         let (mx, mn) = (r.max(g).max(b) as f32, r.min(g).min(b) as f32);
         let chroma = mx - mn;
+        lsum += (54 * r as u64 + 183 * g as u64 + 19 * b as u64) >> 8;
         let lum = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
         if chroma < NEUTRAL_CHROMA {
             neutral += 1;
@@ -76,9 +94,15 @@ pub fn line_stats(px: impl Iterator<Item = [u8; 3]>) -> Option<LineStats> {
     // the busiest bin is a light background when all three channels are in the top three eighths (>= 192)
     let (top_i, &top_n) = bins.iter().enumerate().max_by_key(|(_, &c)| c).unwrap();
     let light_bg = if (top_i >> 6) >= 6 && ((top_i >> 3) & 7) >= 6 && (top_i & 7) >= 6 { top_n as f32 / n as f32 } else { 0.0 };
+    // palette coverage: pixels in the 8 busiest bins or the bins next to them (anti-aliasing and JPEG noise
+    // spread a solid fill over its neighbours)
+    let mut order: Vec<usize> = (0..512).collect();
+    order.sort_unstable_by_key(|&i| std::cmp::Reverse(bins[i]));
+    let near = |i: usize, j: usize| (i >> 6).abs_diff(j >> 6) <= 1 && ((i >> 3) & 7).abs_diff((j >> 3) & 7) <= 1 && (i & 7).abs_diff(j & 7) <= 1;
+    let top8 = (0..512).filter(|&j| order[..8].iter().any(|&i| near(i, j))).map(|j| bins[j]).sum::<u32>() as f32 / n as f32;
     bins.sort_unstable_by(|a, b| b.cmp(a));
     let flat = bins[..6].iter().sum::<u32>() as f32 / n as f32;
-    Some(LineStats { white: w, neutral: ne, flat, light_bg })
+    Some(LineStats { white: w, neutral: ne, flat, light_bg, top8, mean: lsum as f32 / n as f32 / 255.0 })
 }
 
 /// Images covering more than this share of the page are scans and are always recolored.
@@ -706,5 +730,24 @@ mod tests {
         let r = rc.regions(&[k], 1.0e6, 1.0, (0, 0), (400, 400));
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].kind, RegionKind::Keep);
+    }
+
+    #[test]
+    fn flat_fill_diagrams_are_flat_whatever_the_white_share() {
+        // white, light blue/green/orange fills, black ink, with +-4 noise: 40% fills, 8% ink
+        let fills = [[200u8, 225, 245], [205, 240, 205], [250, 200, 130], [180, 200, 230], [240, 240, 170]];
+        let px: Vec<[u8; 3]> = (0..6000)
+            .map(|i| {
+                let n = noise(i) as i16;
+                let c = if i % 25 < 2 { [20, 20, 20] } else if i % 5 < 2 { fills[(i / 7) % 5] } else { [255, 255, 255] };
+                c.map(|v| (v as i16 + n).clamp(0, 255) as u8)
+            })
+            .collect();
+        let st = line_stats(px.into_iter()).unwrap();
+        assert!(st.is_flat(), "{st:?}");
+        assert!(!st.is_photographic());
+        // a photograph: smooth ramps across the colour cube
+        let ph = line_stats((0..6000).map(|i| [(i * 7 % 256) as u8, (i * 13 % 256) as u8, (i * 29 % 256) as u8])).unwrap();
+        assert!(!ph.is_flat() && ph.is_photographic());
     }
 }

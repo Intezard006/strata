@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mupdf::{Colorspace, ColorParams, Device, IRect, Image, Matrix, Pixmap};
 
 /// Bump to reclassify every non-overridden image once.
-pub const CLASSIFIER_VERSION: u8 = 5;
+pub const CLASSIFIER_VERSION: u8 = 6;
 
 const MAGIC: &[u8; 4] = b"SIMG";
 /// Format 2 entries are 10 bytes (id, flags, version) plus 3 when the flags say the placement has a cell grid;
@@ -654,6 +654,32 @@ pub fn verdict_from_cells(cells: &[bool], nx: usize, ny: usize) -> Verdict {
     Verdict { class: Class::Photo, grid: Grid { nx: nx as u8, ny: ny as u8, bits } }
 }
 
+/// Whether a split into line cells (`line`) and the rest is real: the other cells together must be photographic
+/// (many colours or dark), and both kinds must each form one 4-connected block.
+pub fn genuine_split(line: &[bool], rest_photographic: bool, nx: usize, ny: usize) -> bool {
+    if !rest_photographic {
+        return false;
+    }
+    let blocks = |want: bool| {
+        let Some(start) = line.iter().position(|&l| l == want) else { return true };
+        let mut seen = vec![false; line.len()];
+        let mut todo = vec![start];
+        seen[start] = true;
+        while let Some(i) = todo.pop() {
+            let (x, y) = (i % nx, i / nx);
+            let nb = [(x > 0).then(|| i - 1), (x + 1 < nx).then(|| i + 1), (y > 0).then(|| i - nx), (y + 1 < ny).then(|| i + nx)];
+            for j in nb.into_iter().flatten() {
+                if line[j] == want && !seen[j] {
+                    seen[j] = true;
+                    todo.push(j);
+                }
+            }
+        }
+        line.iter().zip(&seen).all(|(&l, &s)| l != want || s)
+    };
+    blocks(true) && blocks(false)
+}
+
 /// Classify the visible crop of a placement (not the whole stream, and not per tile, so the result does not
 /// depend on zoom): the image drawn as placed onto a white thumbnail of the visible rect, which makes MuPDF
 /// decode it subsampled. A crop of mixed content is judged per cell of a coarse grid.
@@ -694,23 +720,43 @@ pub fn classify(p: &Placement, cs: &Colorspace) -> Verdict {
     }
     let n = pix.n() as usize;
     let (stride, sm) = (pix.stride() as usize, pix.samples());
+    let px = |x: usize, y: usize| {
+        let q = &sm[y * stride + x * n..];
+        [q[0], q[1], q[2]]
+    };
+    let whole = crate::recolor::line_stats((0..ph as usize).flat_map(|y| (0..pw as usize).map(move |x| (x, y))).map(|(x, y)| px(x, y)));
+    if whole.is_some_and(|s| s.is_flat() && s.mean >= crate::recolor::DARK_MEAN) {
+        return Verdict::plain(Class::Line); // a palette-limited graphic, however much white it has
+    }
+    if std::env::var_os("STRATA_DEBUG").is_some() {
+        eprintln!("imagemap: whole {whole:?}");
+    }
+    let whole_line = whole.is_some_and(|s| s.is_line());
     let (nx, ny) = grid_dims(w, h);
+    if nx * ny == 1 {
+        return Verdict::plain(if whole_line { Class::Line } else { Class::Photo });
+    }
     let mut cells = Vec::with_capacity(nx * ny);
     for cy in 0..ny {
         for cx in 0..nx {
             let (x0, x1) = (cx * pw as usize / nx, (cx + 1) * pw as usize / nx);
             let (y0, y1) = (cy * ph as usize / ny, (cy + 1) * ph as usize / ny);
-            let st = crate::recolor::line_stats((y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| {
-                let q = &sm[y * stride + x * n..];
-                [q[0], q[1], q[2]]
-            }));
+            let st = crate::recolor::line_stats((y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| px(x, y)));
             if std::env::var_os("STRATA_DEBUG").is_some() {
                 eprintln!("imagemap: cell {cx},{cy} stats {st:?}");
             }
             cells.push(st.is_some_and(|s| s.is_line()));
         }
     }
-    verdict_from_cells(&cells, nx, ny)
+    let v = verdict_from_cells(&cells, nx, ny);
+    if v.grid.is_some() {
+        let rest = crate::recolor::line_stats((0..ph as usize).flat_map(|y| (0..pw as usize).map(move |x| (x, y))).filter(|&(x, y)| !cells[(y * ny / ph as usize) * nx + x * nx / pw as usize]).map(|(x, y)| px(x, y)));
+        if rest.is_some_and(|r| r.is_photographic()) && genuine_split(&cells, true, nx, ny) {
+            return v;
+        }
+        return Verdict::plain(if whole_line { Class::Line } else { Class::Photo });
+    }
+    v
 }
 
 /// Verdict for a placement: from the map if known, else classified (and recorded). `Scan` is by geometry.
@@ -889,14 +935,19 @@ mod tests {
     /// A 300x300 pt page: a 4x4 image (top half white, bottom half dark grey) at pdf (0,50)-(200,250) drawn
     /// three times: clipped to its top half, clipped to its bottom half, and whole.
     fn deck() -> Vec<u8> {
-        let img = "FFFFFFFF FFFFFFFF 20202020 20202020>";
+        // 8x8 RGB: white above, a spread of colours below
+        let mut img = "FFFFFF".repeat(32);
+        for i in 0..32u32 {
+            img += &format!("{:02X}{:02X}{:02X}", i * 37 % 256, i * 91 % 256, i * 53 % 256);
+        }
+        img.push('>');
         let content = "q 0 150 200 100 re W n 200 0 0 200 0 50 cm /Im Do Q\n\
                        q 0 50 200 100 re W n 200 0 0 200 0 50 cm /Im Do Q\n\
                        q 200 0 0 200 0 50 cm /Im Do Q\n";
         format!(
             "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
              3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 300]/Resources<</XObject<</Im 4 0 R>>>>/Contents 5 0 R>>endobj\n\
-             4 0 obj<</Type/XObject/Subtype/Image/Width 4/Height 4/ColorSpace/DeviceGray/BitsPerComponent 8/Filter/ASCIIHexDecode/Length {}>>stream\n{img}\nendstream endobj\n\
+             4 0 obj<</Type/XObject/Subtype/Image/Width 8/Height 8/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/ASCIIHexDecode/Length {}>>stream\n{img}\nendstream endobj\n\
              5 0 obj<</Length {}>>stream\n{content}endstream endobj\ntrailer<</Root 1 0 R>>\n",
             img.len(),
             content.len()
@@ -983,5 +1034,16 @@ mod tests {
         let l = ImageMap::load(&d);
         assert_eq!((l.len(), l.class(8), l.ovr(8)), (1, None, Ovr::Keep));
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn splits_must_be_contiguous_and_photographic() {
+        // top row line art, bottom row the rest
+        let line = [true, true, true, true, false, false, false, false];
+        assert!(genuine_split(&line, true, 4, 2));
+        assert!(!genuine_split(&line, false, 4, 2));
+        // line art in two separate blocks: no
+        let sc = [true, false, false, true, false, false, false, false];
+        assert!(!genuine_split(&sc, true, 4, 2));
     }
 }
