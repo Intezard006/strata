@@ -112,6 +112,23 @@ pub enum Command {
     OcrCancel,
     Reindex,
     WriteIndex(Option<String>, bool),
+    CopySelection,
+    Highlight,
+    /// Colour 1-4 of the selection (and its highlight).
+    HlColor(u8),
+    Note(String),
+    HDelete,
+    HList,
+    HExport(Option<String>),
+    HWrite(Option<String>, bool),
+    /// Rectangle snip to the clipboard as an image.
+    Snip,
+    /// Rectangle snip, OCR'd, to the clipboard as text.
+    SnipText,
+    /// Pin the page (or open preview target) in a side pane; again to unpin.
+    Pin,
+    /// Switch focus between the document and the pin pane.
+    PinFocus,
 }
 
 /// `:` command registry: (name, argument synopsis, description).
@@ -195,6 +212,19 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("reindex", "", "Recompute the generated index"),
     ("writeindex", "[PATH]", "Write a copy of the PDF with the generated index as outline"),
     ("writeindex!", "[PATH]", "Like writeindex, overwriting an existing file"),
+    ("copy-selection", "", "Copy the selected text (mouse drag selects) to the clipboard with wl-copy"),
+    ("highlight", "", "Highlight the selected text; keys 1-4 pick the colour while a selection is active"),
+    ("hl-color", "1-4", "Set the colour of the selection and of its highlight"),
+    ("note", "TEXT", "Attach a note to the selection's highlight (margin marker; click the marker to read it)"),
+    ("hdelete", "", "Delete the highlight made from the current selection"),
+    ("hlist", "", "List highlights and notes (type to filter, Enter jumps, Ctrl-X deletes)"),
+    ("hexport", "[PATH]", "Write the highlights and notes as Markdown grouped by (printed) page"),
+    ("hwrite", "[PATH]", "Write a copy of the PDF with the highlights as real annotations (never the original)"),
+    ("hwrite!", "[PATH]", "Like hwrite, overwriting an existing file"),
+    ("snip", "", "Drag a rectangle (or Alt+drag any time) to copy it as a 2x PNG image to the clipboard (option snip-original)"),
+    ("snip-text", "", "Drag a rectangle and OCR it with tesseract; the text goes to the clipboard"),
+    ("pin", "", "Pin the current page (or the open preview target) in a side pane (option pin-width); again to unpin"),
+    ("pin-focus", "", "Switch scroll/zoom focus between the document and the pin pane"),
 ];
 
 pub fn describe(name: &str) -> &'static str {
@@ -322,6 +352,19 @@ pub fn parse_words(name: &str, args: &[String]) -> Result<Command, String> {
         "reindex" => Reindex,
         "writeindex" => WriteIndex(args.first().cloned(), false),
         "writeindex!" => WriteIndex(args.first().cloned(), true),
+        "copy-selection" => CopySelection,
+        "highlight" => Highlight,
+        "hl-color" => HlColor(one()?.parse().ok().filter(|n| (1..=4).contains(n)).ok_or_else(|| "hl-color: expected 1-4".to_string())?),
+        "note" => Note(rest()?),
+        "hdelete" => HDelete,
+        "hlist" => HList,
+        "hexport" => HExport(args.first().cloned()),
+        "hwrite" => HWrite(args.first().cloned(), false),
+        "hwrite!" => HWrite(args.first().cloned(), true),
+        "snip" => Snip,
+        "snip-text" => SnipText,
+        "pin" => Pin,
+        "pin-focus" => PinFocus,
         "open" => Open(rest()?),
         "reload" => Reload,
         "reload-config" | "source" => ReloadConfig,
@@ -385,6 +428,10 @@ const DEFAULTS: &[(Mode, &str, &str)] = &[
     (Mode::Normal, "gb", "blist"),
     (Mode::Normal, "gf", "float"),
     (Mode::Normal, "gi", "image-toggle"),
+    (Mode::Normal, "gP", "pin"),
+    (Mode::Normal, "<C-w>", "pin-focus"),
+    (Mode::Normal, "y", "copy-selection"),
+    (Mode::Normal, "H", "highlight"),
     (Mode::Normal, "<C-t>", "profile-cycle"),
     (Mode::Normal, "<C-p>", "palette"),
     (Mode::Popup, "<CR>", "popup-jump"),

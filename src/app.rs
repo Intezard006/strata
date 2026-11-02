@@ -26,7 +26,7 @@ use crate::recolor::Recolor;
 use crate::previews::{Kind, Ref};
 use crate::pstore::Store;
 use crate::imagemap::Ovr;
-use crate::render::{Cmd, ImagePick, PreviewReq, RenderHandle, Request, Response, SearchReq, Tile, TileCache, TileKey, Toggled};
+use crate::render::{Cmd, ImagePick, PreviewReq, RenderHandle, Request, Response, SearchReq, SnipReq, Tile, TileCache, TileKey, Toggled};
 use crate::search::{case_sensitive, Hit, Search};
 use crate::text::TextRenderer;
 use crate::ui::help::Help;
@@ -37,6 +37,10 @@ use crate::ext::{self, Ext, SharedInfo};
 use crate::synctex;
 use crate::pages;
 use crate::ui::popup::{self, Popup};
+use crate::ui::select::{self, Ch, Highlight, Selection};
+
+mod hl;
+pub use hl::write_highlights;
 use crate::ui::index::{self, Index, Item};
 use crate::worker::{Job, Msg};
 use crate::ui::input::{History, InputBar};
@@ -121,6 +125,23 @@ struct PresentSaved {
 struct Present {
     page: usize,
     saved: PresentSaved,
+}
+
+/// A mouse drag in the main window.
+enum Drag {
+    None,
+    /// Selecting text; `moved` once the pointer left the click slop (a plain click follows links).
+    Select { press: (f64, f64), moved: bool },
+    /// Rubber-banding a snip rectangle (window pixels).
+    Snip { from: (f64, f64), to: (f64, f64) },
+}
+
+/// The selection's anchors on `page`, in page points (kept so the selection can be recomputed
+/// when the page's characters arrive).
+struct SelPts {
+    page: u32,
+    from: (f32, f32),
+    to: (f32, f32),
 }
 
 struct Placed {
@@ -246,10 +267,26 @@ pub struct App {
     profiles: Vec<config::Profile>,
     base: Config,
     profile_active: Option<String>,
+    drag: Drag,
+    sel: Option<Selection>,
+    sel_pts: Option<SelPts>,
+    /// Characters of the selection's page; dropped with the selection.
+    sel_chars: Option<(u32, Vec<Ch>)>,
+    sel_chars_pending: Option<u32>,
+    sel_color: u8,
+    /// The open document has highlights (so pages only query the database when it does).
+    hl_any: bool,
+    hl_cache: HashMap<u32, Vec<Highlight>>,
+    /// `:snip` was typed: the next drag is a rectangle.
+    snip_armed: bool,
+    snip_id: u64,
+    /// The armed or running snip is for OCR.
+    snip_text: bool,
 }
 
 #[derive(Clone, Debug)]
 enum JobKind {
+    WriteHighlights(PathBuf),
     Analyze,
     /// Background classification of every image (`--images-only`).
     Images,
@@ -358,7 +395,19 @@ impl App {
             profiles: Vec::new(),
             base: Config::default(),
             profile_active: None,
+            drag: Drag::None,
+            sel: None,
+            sel_pts: None,
+            sel_chars: None,
+            sel_chars_pending: None,
+            sel_color: 0,
+            hl_any: false,
+            hl_cache: HashMap::new(),
+            snip_armed: false,
+            snip_id: 0,
+            snip_text: false,
         };
+        app.load_hl_flag();
         app.load_config();
         app.sync_info();
         app
@@ -597,7 +646,7 @@ impl App {
                 let kind = self.job.as_ref().map(|j| j.1.clone());
                 self.job_status = None;
                 match kind {
-                    Some(JobKind::WriteIndex(dst)) => self.msg(format!("Wrote {}", dst.display())),
+                    Some(JobKind::WriteIndex(dst) | JobKind::WriteHighlights(dst)) => self.msg(format!("Wrote {}", dst.display())),
                     Some(JobKind::Images) => {
                         // merge what the child found; entries the viewer met meanwhile and overrides stay
                         if let Ok(mut m) = self.render.images.lock() {
@@ -808,6 +857,13 @@ impl App {
         if let (Some(d), Some(k)) = (&self.db, &self.key) {
             d.note_open(k, &self.path);
         }
+        self.clear_selection();
+        self.load_hl_flag();
+    }
+
+    fn load_hl_flag(&mut self) {
+        self.hl_cache.clear();
+        self.hl_any = matches!((&self.db, &self.key), (Some(d), Some(k)) if d.highlight_count(k) > 0);
     }
 
     fn set_mark(&mut self, c: char) {
@@ -858,6 +914,10 @@ impl App {
     fn run_act(&mut self, a: Act, el: &ActiveEventLoop) {
         match a {
             Act::Bookmark(n) => self.exec(Command::Bjump(n), None, el),
+            Act::Highlight(_, page, y) => {
+                self.jumps.push(self.sy);
+                self.goto_page_y(page as usize, Some(y));
+            }
             Act::Open(path) => self.exec(Command::Open(path), None, el),
             Act::Goto(page, y) => {
                 self.jumps.push(self.sy);
@@ -978,7 +1038,7 @@ impl App {
         if self.float_solo {
             return;
         }
-        let region = self.popup.as_ref().and_then(|p| self.pv.as_ref().map(|pv| &pv.targets[p.target as usize])).map(|t| (t.page as usize, t.rect));
+        let region = self.popup.as_ref().and_then(|p| self.pv.as_ref().and_then(|pv| pv.targets.get(p.target as usize))).map(|t| (t.page as usize, t.rect));
         let page = region.map_or_else(|| self.current_page(), |r| r.0);
         let attrs = Window::default_attributes()
             .with_title("strata-float")
@@ -1275,6 +1335,9 @@ impl App {
                     self.start_reload();
                 }
             }
+            Ext::Notice(m, e) => {
+                if e { self.err(m) } else { self.msg(m) }
+            }
             Ext::Signal => el.exit(),
             Ext::Exec(line) if debug() && line.starts_with("debug-shot ") => {
                 self.shot = Some(PathBuf::from(line["debug-shot ".len()..].trim()));
@@ -1285,6 +1348,23 @@ impl App {
                 let tok = line["debug-key ".len()..].trim().to_string();
                 let ch = Some(tok.chars().next().filter(|_| tok.chars().count() == 1)).flatten();
                 self.on_key(tok, ch, el);
+            }
+            Ext::Exec(line) if debug() && line.starts_with("debug-drag ") => {
+                // developer aid: a left-button drag between two window points ("alt" as 5th word holds Alt)
+                let v: Vec<&str> = line["debug-drag ".len()..].split_whitespace().collect();
+                let n: Vec<f64> = v.iter().take(4).filter_map(|x| x.parse().ok()).collect();
+                if n.len() == 4 {
+                    let saved = self.mods;
+                    if v.get(4) == Some(&"alt") {
+                        self.mods = ModifiersState::ALT;
+                    }
+                    self.cursor = (n[0], n[1]);
+                    self.mouse_press();
+                    self.cursor = (n[2], n[3]);
+                    self.mouse_move();
+                    self.mouse_release();
+                    self.mods = saved;
+                }
             }
             Ext::Exec(line) if debug() && line.starts_with("debug-click") => {
                 self.mouse_button(MouseButton::Left);
@@ -1722,7 +1802,11 @@ impl App {
                     None => self.err("No search results".into()),
                 }
             }
-            Command::ClearHighlight => self.highlight = false,
+            Command::ClearHighlight => {
+                self.highlight = false;
+                self.snip_armed = false;
+                self.clear_selection();
+            }
             Command::Follow => self.start_hints(),
             Command::JumpBack => {
                 if let Some(y) = self.jumps.back(self.sy) {
@@ -1757,7 +1841,9 @@ impl App {
                 }
             }
             Command::PopupYank => {
-                if let (Some(p), Some(pv)) = (&self.popup, &self.pv) {
+                if let Some(n) = self.popup.as_ref().and_then(|p| p.note.clone()) {
+                    self.to_clipboard(n);
+                } else if let (Some(p), Some(pv)) = (&self.popup, &self.pv) {
                     let t = &pv.targets[p.target as usize];
                     self.yank_pending = true;
                     let _ = self.render.req_tx.send(Cmd::Text { page: t.page, rect: t.rect });
@@ -1822,6 +1908,17 @@ impl App {
             }
             Command::Reindex => self.start_analysis(false, true),
             Command::WriteIndex(path, force) => self.write_index(path, force),
+            Command::CopySelection => self.copy_selection(),
+            Command::Highlight => self.highlight_selection(),
+            Command::HlColor(c) => self.set_hl_color(c),
+            Command::Note(t) => self.note_selection(t),
+            Command::HDelete => self.delete_selection_highlight(),
+            Command::HList => self.open_hlist(),
+            Command::HExport(p) => self.export_highlights(p),
+            Command::HWrite(p, force) => self.write_highlights_pdf(p, force),
+            Command::Snip => self.arm_snip(false),
+            Command::SnipText => self.arm_snip(true),
+            Command::Pin | Command::PinFocus => {}
             Command::ReloadConfig => {
                 self.load_config();
                 if self.message.is_none() {
@@ -1952,6 +2049,9 @@ impl App {
         }
         let (xp, yp) = (self.x0() + mx / s, self.sy + my / s);
         let (p, lx, ly) = self.page_point(xp, yp);
+        if self.click_marker() {
+            return;
+        }
         let hit = self.links.get(&(p as u32)).and_then(|ls| {
             ls.iter().find(|l| lx >= l.rect[0] && lx <= l.rect[2] && ly >= l.rect[1] && ly <= l.rect[3]).map(|l| l.target.clone())
         });
@@ -2040,7 +2140,7 @@ impl App {
         if debug() {
             eprintln!("open popup target {target} hover={hover}");
         }
-        self.popup = Some(Popup { target, id: 0, tile: None, zoom: 1.0, scroll: 0, hover, anchor, ref_rect, title, rect: (0, 0, 0, 0) });
+        self.popup = Some(Popup { target, id: 0, tile: None, zoom: 1.0, scroll: 0, hover, anchor, ref_rect, title, note: None, rect: (0, 0, 0, 0) });
         if !hover {
             self.mode = Mode::Popup;
         }
@@ -2049,7 +2149,7 @@ impl App {
 
     fn request_popup(&mut self) {
         let (Some(p), Some(pv)) = (self.popup.as_mut(), self.pv.as_ref()) else { return };
-        let t = &pv.targets[p.target as usize];
+        let Some(t) = pv.targets.get(p.target as usize) else { return };
         let (rw, rh) = ((t.rect[2] - t.rect[0]).max(4.0), (t.rect[3] - t.rect[1]).max(4.0));
         let base = (0.6 * self.vp.0 as f32 / rw).min(self.cfg.preview_max_scale * self.dpi);
         // tall targets shrink to fit the window, but never below 60% of the width-fit scale
@@ -2072,7 +2172,7 @@ impl App {
     }
 
     fn popup_jump(&mut self) {
-        let Some(t) = self.popup.as_ref().and_then(|p| self.pv.as_ref().map(|pv| pv.targets[p.target as usize].clone())) else { return };
+        let Some(t) = self.popup.as_ref().and_then(|p| self.pv.as_ref().and_then(|pv| pv.targets.get(p.target as usize).cloned())) else { return };
         self.close_popup();
         if matches!(self.overlay, Overlay::List(_)) {
             self.overlay = Overlay::None;
@@ -2203,6 +2303,7 @@ impl App {
             Overlay::Pick(pk) => match token.as_str() {
                 "<Esc>" => self.overlay = Overlay::None,
                 "<C-u>" => pk.clear_query(),
+                "<C-x>" if pk.kind == PickKind::Highlights => self.hlist_delete_current(),
                 "<BS>" => pk.backspace(),
                 "<Down>" | "<C-n>" => pk.move_sel(1),
                 "<Up>" | "<C-p>" => pk.move_sel(-1),
@@ -2222,7 +2323,10 @@ impl App {
                 }
             },
             Overlay::None => {
-                if let Some((cmd, count)) = self.keys.feed(&self.keymap, self.mode, &token) {
+                if let (Some(d @ '1'..='4'), true, true) = (ch, self.sel.is_some(), self.mode == Mode::Normal && self.keys.display().is_empty()) {
+                    // colour of the active selection
+                    self.exec(Command::HlColor(d as u8 - b'0'), None, el);
+                } else if let Some((cmd, count)) = self.keys.feed(&self.keymap, self.mode, &token) {
                     self.exec(cmd, count, el);
                 }
             }
@@ -2533,6 +2637,7 @@ impl App {
             let (ox, oy) = self.page_origin(fp as usize);
             hl.push(((ox as f32 + r[0] * s) as i32, (oy as f32 + r[1] * s) as i32, ((r[2] - r[0]) * s).ceil() as i32, ((r[3] - r[1]) * s).ceil() as i32, true));
         }
+        let marks = self.mark_rects();
         let mut hint_draw: Vec<(i32, i32, String, usize)> = Vec::new();
         if let Overlay::Hints(hs) = &self.overlay {
             for it in &hs.items {
@@ -2559,6 +2664,7 @@ impl App {
                 PickKind::Bookmarks => "BOOKMARKS",
                 PickKind::Recent => "RECENT",
                 PickKind::Palette => "PALETTE",
+                PickKind::Highlights => "HIGHLIGHTS",
             },
             (_, Mode::Popup) => "PREVIEW",
             (_, Mode::Index) => "INDEX",
@@ -2588,6 +2694,10 @@ impl App {
         }
         for &(x, y, ww, hh, cur) in &hl {
             let c = if cur { pm(CUR_HIT_COLOR, 0x90) } else { pm(HIT_COLOR, 0x55) };
+            cv.fill_rect(x, y, ww, hh, c);
+        }
+
+        for &(x, y, ww, hh, c) in &marks {
             cv.fill_rect(x, y, ww, hh, c);
         }
 
@@ -2913,6 +3023,8 @@ impl ApplicationHandler<()> for App {
                         p.tile = Some(tile);
                     }
                 }
+                Response::PageChars { page, chars } => self.on_page_chars(page, chars),
+                Response::Snip { png, text, .. } => self.on_snip(png, text),
                 Response::Text(t) => {
                     if std::mem::take(&mut self.yank_pending) {
                         self.to_clipboard(t);
@@ -2976,6 +3088,7 @@ impl ApplicationHandler<()> for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                self.mouse_move();
                 self.update_hover();
             }
             WindowEvent::CursorLeft { .. } => {
@@ -2992,9 +3105,13 @@ impl ApplicationHandler<()> for App {
                     if self.mods.control_key() && self.cfg.synctex {
                         self.synctex_edit();
                     } else {
-                        self.click();
+                        self.mouse_press();
                     }
                 }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                self.mouse_release();
+                self.redraw();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } if matches!(self.overlay, Overlay::Input(_)) => {
                 self.input_key("<MiddlePaste>", None, el);

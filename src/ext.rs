@@ -32,6 +32,8 @@ pub enum Ext {
     PinchEnd,
     /// The open file was written or replaced on disk (auto-reload).
     FileChanged,
+    /// A message from a helper thread (clipboard, OCR): text and whether it is an error.
+    Notice(String, bool),
 }
 
 /// What the D-Bus properties report; updated by the app when the page or file changes.

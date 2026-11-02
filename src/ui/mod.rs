@@ -6,6 +6,7 @@ pub mod input;
 pub mod pick;
 pub mod plist;
 pub mod popup;
+pub mod select;
 pub mod statusbar;
 
 /// Premultiplied 0xAARRGGBB drawing surface over a softbuffer slice.

@@ -40,6 +40,22 @@ page-to-screen transform, so they stay correct.
 page prefetched. `j k Space BackSpace` the arrows and a left click move one page; `Esc q F5` end it and restore the
 previous page, offset and zoom exactly. `presentation-bg` sets the surround; recolor and profiles apply as usual.
 
+Dragging with the left button selects text (from the text layer; for a scan, from its OCR copy, the same source search
+uses; a selection stays on one page). A plain click still follows links. `y` (`:copy-selection`) copies it with `wl-copy`.
+`H` (`:highlight`) highlights the selection; `1`-`4` pick the colour while a selection is active; `:note TEXT` attaches a
+note, shown as a margin marker that opens in the popup panel when clicked; `:hdelete` removes the selection's highlight.
+`:hlist` lists them (Enter jumps, Ctrl-X deletes), `:hexport [PATH]` writes Markdown grouped by printed page,
+`:hwrite [PATH]` (`:hwrite!` to overwrite) writes a PDF copy with real highlight annotations in a one-shot child
+process and never touches the original. Highlights live in the state database and are loaded per visible page only.
+
+`Alt`+drag (or `:snip` then drag) copies a rectangle as a 2x PNG (`wl-copy --type image/png`), rendered in the original
+colours (`snip-original`, default true). `:snip-text` OCRs the rectangle with a niced `tesseract` and copies the text.
+
+`gP` (`:pin`) pins the current page (or the open preview target) in a right-hand pane of the window (`pin-width`, default
+35%); `gP` again unpins. `Ctrl-w` (`:pin-focus`) moves scroll/zoom (`j k Space + - = s`, wheel, Esc) between the document
+and the pane; the mouse wheel acts on whichever the pointer is over. The pane shares the tile cache and its tiles count as
+on screen.
+
 State (last position, zoom, recolor, bookmarks, marks, jumplist) is stored in `~/.local/share/strata/strata.db` and
 written on close, focus loss, `:open` and SIGTERM/SIGINT; `set restore-position false` turns restoring off.
 

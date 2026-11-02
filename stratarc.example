@@ -67,6 +67,13 @@ set book-rtl             false    # right-to-left spreads (manga, Arabic, Hebrew
 # left-click change the page by exactly one, Esc q F5 return to the previous page, offset and zoom.
 set presentation-bg      #000000  # rgba(0,0,0,0) lets the desktop show through
 
+# Selection and snips: drag selects text (y copies, H highlights, 1-4 colour, :note TEXT, :hlist, :hexport, :hwrite);
+# Alt+drag or :snip copies a rectangle as a 2x PNG, :snip-text OCRs it. All via wl-copy / tesseract subprocesses.
+set snip-original        true     # snips keep the page's original colours instead of the recolored look
+
+# Pin pane (gP, :pin): the page or preview target in a right-hand split; Ctrl-w switches focus to it.
+set pin-width            35       # percent of the window
+
 # map [mode] KEYS COMMAND     (modes: normal, index)
 map <C-x> goto 1
 # unmap <Space>

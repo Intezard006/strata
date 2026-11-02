@@ -5,6 +5,8 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
+use crate::ui::select::{decode_rects, encode_rects, Highlight};
+
 pub const JUMPS_MAX: usize = 100;
 
 /// Where the reader was: page, offset below that page's top (points), zoom and recolor.
@@ -47,6 +49,10 @@ CREATE TABLE IF NOT EXISTS gmarks(
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS jumps(
   key TEXT PRIMARY KEY, pos INTEGER NOT NULL, list TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS highlights(
+  id INTEGER PRIMARY KEY, key TEXT NOT NULL, page INTEGER NOT NULL, quads BLOB NOT NULL,
+  color INTEGER NOT NULL, text TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS highlights_doc ON highlights(key, page);
 ";
 
 fn now() -> i64 {
@@ -152,6 +158,46 @@ impl Db {
         self.conn.prepare_cached("SELECT v FROM kv WHERE k=?1").ok()?.query_row([k], |r| r.get(0)).optional().ok().flatten()
     }
 
+    /// Store a new highlight (its `id` and `created` are assigned here); returns the id.
+    pub fn add_highlight(&self, key: &str, h: &Highlight) -> Option<i64> {
+        self.conn
+            .prepare_cached("INSERT INTO highlights(key,page,quads,color,text,note,created) VALUES(?1,?2,?3,?4,?5,?6,?7)")
+            .and_then(|mut s| s.execute(params![key, h.page, encode_rects(&h.rects), h.color, h.text, h.note, now()]))
+            .ok()?;
+        Some(self.conn.last_insert_rowid())
+    }
+
+    fn hl_row(r: &rusqlite::Row) -> rusqlite::Result<Highlight> {
+        Ok(Highlight { id: r.get(0)?, page: r.get(1)?, rects: decode_rects(&r.get::<_, Vec<u8>>(2)?), color: r.get(3)?, text: r.get(4)?, note: r.get(5)?, created: r.get(6)? })
+    }
+
+    pub fn highlights_on_page(&self, key: &str, page: u32) -> Vec<Highlight> {
+        let Ok(mut s) = self.conn.prepare_cached("SELECT id,page,quads,color,text,note,created FROM highlights WHERE key=?1 AND page=?2 ORDER BY id") else { return Vec::new() };
+        s.query_map(params![key, page], Self::hl_row).map(|it| it.flatten().collect()).unwrap_or_default()
+    }
+
+    /// Every highlight of a document, in page order.
+    pub fn highlights(&self, key: &str) -> Vec<Highlight> {
+        let Ok(mut s) = self.conn.prepare_cached("SELECT id,page,quads,color,text,note,created FROM highlights WHERE key=?1 ORDER BY page,id") else { return Vec::new() };
+        s.query_map([key], Self::hl_row).map(|it| it.flatten().collect()).unwrap_or_default()
+    }
+
+    pub fn highlight_count(&self, key: &str) -> usize {
+        self.conn.prepare_cached("SELECT COUNT(*) FROM highlights WHERE key=?1").ok().and_then(|mut s| s.query_row([key], |r| r.get::<_, i64>(0)).ok()).unwrap_or(0) as usize
+    }
+
+    pub fn set_highlight_note(&self, id: i64, note: &str) -> bool {
+        self.conn.prepare_cached("UPDATE highlights SET note=?2 WHERE id=?1").and_then(|mut s| s.execute(params![id, note])).map_or(false, |n| n > 0)
+    }
+
+    pub fn set_highlight_color(&self, id: i64, color: u8) -> bool {
+        self.conn.prepare_cached("UPDATE highlights SET color=?2 WHERE id=?1").and_then(|mut s| s.execute(params![id, color])).map_or(false, |n| n > 0)
+    }
+
+    pub fn delete_highlight(&self, id: i64) -> bool {
+        self.conn.prepare_cached("DELETE FROM highlights WHERE id=?1").and_then(|mut s| s.execute(params![id])).map_or(false, |n| n > 0)
+    }
+
     pub fn save_jumps(&self, key: &str, pos: usize, list: &[f32]) {
         let list = &list[list.len().saturating_sub(JUMPS_MAX)..];
         let text: Vec<String> = list.iter().map(|v| v.to_string()).collect();
@@ -205,6 +251,28 @@ mod tests {
         db.set_gmark('A', "k", Path::new("/a.pdf"), 9, 2.0);
         assert_eq!(db.gmark('A'), Some(("k".into(), PathBuf::from("/a.pdf"), 9, 2.0)));
         assert_eq!(db.gmark('B'), None);
+    }
+
+    #[test]
+    fn highlights_round_trip() {
+        let db = Db::memory();
+        let h = |page, text: &str| Highlight { id: 0, page, rects: vec![[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], color: 1, text: text.into(), note: String::new(), created: 0 };
+        assert_eq!(db.highlight_count("k"), 0);
+        let a = db.add_highlight("k", &h(7, "seven")).unwrap();
+        let b = db.add_highlight("k", &h(2, "two")).unwrap();
+        db.add_highlight("other", &h(2, "x"));
+        assert_eq!(db.highlight_count("k"), 2);
+        assert_eq!(db.highlights("k").iter().map(|x| x.page).collect::<Vec<_>>(), [2, 7]);
+        let on7 = db.highlights_on_page("k", 7);
+        assert_eq!(on7.len(), 1);
+        assert_eq!((on7[0].id, on7[0].rects.clone(), on7[0].color), (a, h(7, "").rects, 1));
+        assert!(db.set_highlight_note(a, "check this"));
+        assert!(db.set_highlight_color(a, 3));
+        let on7 = db.highlights_on_page("k", 7);
+        assert_eq!((on7[0].note.as_str(), on7[0].color), ("check this", 3));
+        assert!(db.delete_highlight(b));
+        assert!(!db.delete_highlight(b));
+        assert_eq!(db.highlight_count("k"), 1);
     }
 
     #[test]

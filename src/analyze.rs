@@ -25,7 +25,7 @@ const SCAN_SAMPLES: usize = 10;
 const REOPEN_EVERY: usize = 100;
 const PROGRESS_EVERY: usize = 8;
 
-fn say(s: &str) {
+pub(crate) fn say(s: &str) {
     let mut o = std::io::stdout().lock();
     // the viewer went away: stop quietly
     if writeln!(o, "{s}").and_then(|_| o.flush()).is_err() {

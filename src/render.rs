@@ -10,6 +10,7 @@ use std::thread;
 use mupdf::{Colorspace, Device, Document, IRect, Matrix, Pixmap};
 use crate::links::{LinkInfo, Target};
 use crate::search::{find_matches, Rect4};
+use crate::ui::select::Ch;
 use crate::ui::index::Item;
 use winit::event_loop::EventLoopProxy;
 
@@ -185,8 +186,23 @@ pub struct PreviewReq {
     pub recolor: Recolor,
 }
 
+/// A rectangle rendered to PNG for the clipboard (`:snip`).
+pub struct SnipReq {
+    pub id: u64,
+    pub page: u32,
+    pub rect: [f32; 4],
+    pub scale: f32,
+    /// `None`: the original colours; otherwise the recolored look.
+    pub recolor: Option<Recolor>,
+    /// The PNG is for OCR (`:snip-text`) rather than the clipboard.
+    pub text: bool,
+}
+
 pub enum Cmd {
     Preview(PreviewReq),
+    /// Characters with boxes of one page (text selection), from the search text source.
+    PageChars { page: u32 },
+    Snip(SnipReq),
     /// Plain text inside a rectangle (for the clipboard).
     Text { page: u32, rect: [f32; 4] },
     Tile(Request),
@@ -217,6 +233,8 @@ pub struct Toggled {
 
 pub enum Response {
     Preview { id: u64, tile: Tile },
+    PageChars { page: u32, chars: Vec<Ch> },
+    Snip { png: Option<Vec<u8>>, text: bool },
     Text(String),
     Tile { key: TileKey, gen: u64, tile: Tile },
     /// The renderer discarded the request because it was no longer wanted.
@@ -450,6 +468,17 @@ impl Renderer {
                 self.shrink_store();
                 self.send(Response::Preview { id: req.id, tile });
             }
+            Cmd::PageChars { page } => {
+                let chars = if self.text_path == self.path { page_chars(&self.doc, page) } else { open_doc(&self.text_path).map(|d| page_chars(&d, page)).unwrap_or_default() };
+                self.shrink_store();
+                self.send(Response::PageChars { page, chars });
+            }
+            Cmd::Snip(req) => {
+                let png = self.render_snip(&req);
+                self.shrink_store();
+                unsafe { malloc_trim(0) };
+                self.send(Response::Snip { png, text: req.text });
+            }
             Cmd::Text { page, rect } => {
                 let t = text_in_rect(&self.doc, page, rect);
                 self.send(Response::Text(t));
@@ -617,6 +646,49 @@ impl Renderer {
         Some(Tile { w: pw as u32, h: ph as u32, data })
     }
 
+    /// A rectangle as PNG bytes: original colours on white, or the recolored look on its paper.
+    fn render_snip(&mut self, req: &SnipReq) -> Option<Vec<u8>> {
+        let mut png = Vec::new();
+        match req.recolor {
+            None => {
+                let page = self.doc.load_page(req.page as i32).ok()?;
+                let b = page.bounds().ok()?;
+                let s = req.scale;
+                let (w, h) = (((req.rect[2] - req.rect[0]) * s).ceil().max(1.0) as i32, ((req.rect[3] - req.rect[1]) * s).ceil().max(1.0) as i32);
+                let mut pix = Pixmap::new_with_rect(&self.cs, IRect::new(0, 0, w, h), false).ok()?;
+                pix.clear_with(255).ok()?;
+                let mut ctm = Matrix::new_translate(-(b.x0 + req.rect[0]), -(b.y0 + req.rect[1]));
+                ctm.concat(Matrix::new_scale(s, s));
+                {
+                    let dev = Device::from_pixmap(&pix).ok()?;
+                    page.run(&dev, &ctm).ok()?;
+                }
+                pix.write_to(&mut png, mupdf::pixmap::ImageFormat::PNG).ok()?;
+            }
+            Some(recolor) => {
+                let tile = self.render_preview(&PreviewReq { id: req.id, page: req.page, rect: req.rect, scale: req.scale, recolor })?;
+                let mut pix = Pixmap::new_with_rect(&self.cs, IRect::new(0, 0, tile.w as i32, tile.h as i32), false).ok()?;
+                let paper = if recolor.light[3] > 0 { [recolor.light[0] as u32, recolor.light[1] as u32, recolor.light[2] as u32] } else { [0x1e, 0x1e, 0x2e] };
+                let n = pix.n() as usize;
+                let stride = pix.stride() as usize;
+                let samples = pix.samples_mut();
+                for y in 0..tile.h as usize {
+                    for x in 0..tile.w as usize {
+                        let p = tile.data[y * tile.w as usize + x];
+                        let inv = 255 - (p >> 24);
+                        let o = y * stride + x * n;
+                        for (i, sh) in [16u32, 8, 0].into_iter().enumerate() {
+                            // premultiplied source over the paper colour
+                            samples[o + i] = (((p >> sh) & 0xff) + (paper[i] * inv + 127) / 255).min(255) as u8;
+                        }
+                    }
+                }
+                pix.write_to(&mut png, mupdf::pixmap::ImageFormat::PNG).ok()?;
+            }
+        }
+        Some(png)
+    }
+
     fn send_outline(&mut self) {
         fn walk(list: &[mupdf::Outline], depth: u32, out: &mut Vec<Item>) {
             for o in list {
@@ -740,6 +812,29 @@ pub fn text_in_rect(doc: &Document, p: u32, r: [f32; 4]) -> String {
         }
     }
     s
+}
+
+/// Every character of a page with its box (page points from the origin) and line number.
+pub fn page_chars(doc: &Document, p: u32) -> Vec<Ch> {
+    let Ok(page) = doc.load_page(p as i32) else { return vec![] };
+    let Ok(b) = page.bounds() else { return vec![] };
+    let Ok(tp) = page.to_text_page(mupdf::TextPageFlags::empty()) else { return vec![] };
+    let mut out = Vec::new();
+    let mut line_no = 0u32;
+    for block in &tp.structured().blocks {
+        let mupdf::TextBlockContent::Text { lines } = &block.content else { continue };
+        for line in lines {
+            for c in &line.chars {
+                let mut r = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+                for pt in [c.quad.ul, c.quad.ur, c.quad.ll, c.quad.lr] {
+                    r = [r[0].min(pt.x), r[1].min(pt.y), r[2].max(pt.x), r[3].max(pt.y)];
+                }
+                out.push(Ch { c: c.ch, r: [r[0] - b.x0, r[1] - b.y0, r[2] - b.x0, r[3] - b.y0], line: line_no });
+            }
+            line_no += 1;
+        }
+    }
+    out
 }
 
 fn page_hits(doc: &Document, p: usize, query: &str, cs: bool) -> Vec<Rect4> {

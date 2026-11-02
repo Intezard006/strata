@@ -9,6 +9,7 @@ pub enum PickKind {
     Bookmarks,
     Recent,
     Palette,
+    Highlights,
 }
 
 /// What Enter does with an item.
@@ -20,6 +21,8 @@ pub enum Act {
     Goto(u32, f32),
     Bookmark(String),
     Open(String),
+    /// A highlight: database id, page, y of its first line.
+    Highlight(i64, u32, f32),
 }
 
 /// Palette groups: the prefix typed to restrict to one, and a priority for ranking.
@@ -217,6 +220,14 @@ impl Pick {
         self.refilter();
     }
 
+    /// Drop the selected item (after it was deleted elsewhere).
+    pub fn remove_current(&mut self) {
+        if let Some(&i) = self.shown.get(self.sel) {
+            self.items.remove(i);
+            self.refilter();
+        }
+    }
+
     pub fn clear_query(&mut self) {
         self.query.clear();
         self.sel = 0;
@@ -231,7 +242,8 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Pick, bottom_reserved
     let cw = t.width("M").max(1);
     let pad = cw * 2;
     let hint = if p.kind == PickKind::Palette { "  > cmds  # index  @ bookmarks  = previews  % recent" } else { "" };
-    let title = format!("{}  ({} shown; Enter select, Esc close){}   filter: {}_", p.title, p.shown.len(), hint, p.query);
+    let del = if p.kind == PickKind::Highlights { ", Ctrl-X delete" } else { "" };
+    let title = format!("{}  ({} shown; Enter select{}, Esc close){}   filter: {}_", p.title, p.shown.len(), del, hint, p.query);
     t.draw(cv, pad, 6, &title, ACCENT, cv.w - 2 * pad);
     let top = lh + 14;
     let nrows = ((cv.h - bottom_reserved - top - 6) / lh).max(1) as usize;

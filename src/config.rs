@@ -42,6 +42,9 @@ pub struct Config {
     pub first_page_single: bool,
     pub book_rtl: bool,
     pub presentation_bg: [u8; 4],
+    pub snip_original: bool,
+    /// Pin pane width in percent of the window.
+    pub pin_width: f32,
 }
 
 /// A look profile: option overrides applied on top of the base config.
@@ -123,6 +126,8 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("first-page-single", "Book mode: show the first page alone, as a cover (true/false)"),
     ("book-rtl", "Book mode: right-to-left spreads (true/false)"),
     ("presentation-bg", "Presentation mode background (#rrggbbaa or rgba(r,g,b,a); transparent allowed)"),
+    ("snip-original", "Snips (:snip, Alt+drag) keep the original colours instead of the recolored look (true/false)"),
+    ("pin-width", "Pin pane width in percent of the window (10-70)"),
 ];
 
 impl Default for Config {
@@ -160,6 +165,8 @@ impl Default for Config {
             first_page_single: true,
             book_rtl: false,
             presentation_bg: [0, 0, 0, 255],
+            snip_original: true,
+            pin_width: 35.0,
         }
     }
 }
@@ -276,6 +283,8 @@ impl Config {
             "first-page-single" => self.first_page_single = parse_bool(v)?,
             "book-rtl" => self.book_rtl = parse_bool(v)?,
             "presentation-bg" => self.presentation_bg = parse_color(v)?,
+            "snip-original" => self.snip_original = parse_bool(v)?,
+            "pin-width" => self.pin_width = parse_num(v.trim_end_matches('%'), 10.0, 70.0)?,
             "auto-index" => {
                 self.auto_index = match v {
                     "auto" => AutoIndex::Auto,
@@ -330,6 +339,8 @@ impl Config {
             "first-page-single" => self.first_page_single.to_string(),
             "book-rtl" => self.book_rtl.to_string(),
             "presentation-bg" => fmt_color(self.presentation_bg),
+            "snip-original" => self.snip_original.to_string(),
+            "pin-width" => self.pin_width.to_string(),
             "auto-index" => format!("{:?}", self.auto_index).to_lowercase(),
             _ => return None,
         })

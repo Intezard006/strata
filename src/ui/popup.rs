@@ -19,6 +19,8 @@ pub struct Popup {
     /// The reference this popup explains, in window pixels (x0, y0, x1, y1); the panel avoids covering it.
     pub ref_rect: Option<(i32, i32, i32, i32)>,
     pub title: String,
+    /// A note's text (highlight notes); such a popup has no tile.
+    pub note: Option<String>,
     /// Last drawn panel rectangle (x, y, w, h), for hit testing.
     pub rect: (i32, i32, i32, i32),
 }
@@ -117,9 +119,34 @@ pub fn place(w: i32, h: i32, vw: i32, vh: i32, rr: Option<(i32, i32, i32, i32)>,
     }
 }
 
+/// Greedy word wrap to `max_w` pixels; explicit newlines are kept.
+pub fn wrap(t: &mut TextRenderer, s: &str, max_w: i32) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in s.lines() {
+        let mut cur = String::new();
+        for word in para.split_whitespace() {
+            let trial = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+            if !cur.is_empty() && t.width(&trial) > max_w {
+                out.push(std::mem::replace(&mut cur, word.to_string()));
+            } else {
+                cur = trial;
+            }
+        }
+        out.push(cur);
+    }
+    out
+}
+
 pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup, bottom_reserved: i32, bg: [u8; 4]) {
     let vh = cv.h - bottom_reserved;
-    let (w, h) = panel_size(p.tile.as_ref(), cv.w, vh, p.zoom, t.line_h);
+    let note_lines = p.note.as_deref().map(|n| wrap(t, n, (cv.w * 45 / 100).max(220) - 2 * PAD));
+    let (w, h) = match &note_lines {
+        Some(ls) => {
+            let widest = ls.iter().map(|l| t.width(l)).max().unwrap_or(0).max(t.width(&p.title));
+            ((widest + 2 * PAD + 8).min(cv.w * 95 / 100), (ls.len() as i32 * t.line_h + t.line_h + 6 + PAD + 4).min(vh * 80 / 100))
+        }
+        None => panel_size(p.tile.as_ref(), cv.w, vh, p.zoom, t.line_h),
+    };
     let (x, y) = place(w, h, cv.w, vh, p.ref_rect, p.anchor);
     p.rect = (x, y, w, h);
     // opaque base first, so nothing of the page shows through, then the (nearly opaque) panel colour
@@ -131,6 +158,17 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup, bottom_reserve
     t.draw(cv, x + PAD, y + 3, &p.title, ACCENT, w - 2 * PAD);
     let body_y = y + t.line_h + 6;
     let body_h = h - (t.line_h + 6) - 1;
+    if let Some(ls) = note_lines {
+        let max_scroll = (ls.len() as i32 * t.line_h + PAD - body_h).max(0);
+        p.scroll = p.scroll.min(max_scroll);
+        for (i, l) in ls.iter().enumerate() {
+            let ly = body_y + PAD / 2 + i as i32 * t.line_h - p.scroll;
+            if ly >= body_y && ly + t.line_h <= body_y + body_h {
+                t.draw(cv, x + PAD, ly, l, FG, w - 2 * PAD);
+            }
+        }
+        return;
+    }
     match &p.tile {
         Some(tile) if tile.w > 0 => {
             let max_scroll = (tile.h as i32 + PAD - body_h).max(0);
