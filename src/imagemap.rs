@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mupdf::{Colorspace, ColorParams, Device, IRect, Image, Matrix, Pixmap};
 
 /// Bump to reclassify every non-overridden image once.
-pub const CLASSIFIER_VERSION: u8 = 4;
+pub const CLASSIFIER_VERSION: u8 = 5;
 
 const MAGIC: &[u8; 4] = b"SIMG";
 /// Format 2 entries are 10 bytes (id, flags, version) plus 3 when the flags say the placement has a cell grid;
@@ -642,10 +642,12 @@ pub fn grid_dims(w: f32, h: f32) -> (usize, usize) {
 
 /// Combine per-cell line flags (row-major, `nx` x `ny`): uniform cells give a plain class, a mix a grid.
 pub fn verdict_from_cells(cells: &[bool], nx: usize, ny: usize) -> Verdict {
-    if cells.iter().all(|&c| c) {
+    // a clear majority decides the whole crop; only a genuine split keeps a grid
+    let lines = cells.iter().filter(|&&c| c).count();
+    if lines * 4 >= cells.len() * 3 {
         return Verdict::plain(Class::Line);
     }
-    if !cells.iter().any(|&c| c) {
+    if (cells.len() - lines) * 4 >= cells.len() * 3 {
         return Verdict::plain(Class::Photo);
     }
     let bits = cells.iter().enumerate().fold(0u16, |a, (i, &c)| a | (c as u16) << i);
@@ -940,6 +942,14 @@ mod tests {
     fn cells_combine_into_a_grid_only_when_mixed() {
         assert_eq!(verdict_from_cells(&[true; 6], 3, 2), Verdict::plain(Class::Line));
         assert_eq!(verdict_from_cells(&[false; 4], 2, 2), Verdict::plain(Class::Photo));
+        // 14 of 16 photo cells (or 12 of 16 line cells) collapse to one class
+        let mut c = [false; 16];
+        c[11] = true;
+        c[15] = true;
+        assert_eq!(verdict_from_cells(&c, 4, 4), Verdict::plain(Class::Photo));
+        assert_eq!(verdict_from_cells(&c.map(|x| !x), 4, 4), Verdict::plain(Class::Line));
+        c[..6].fill(true);
+        assert!(verdict_from_cells(&c, 4, 4).grid.is_some());
         let v = verdict_from_cells(&[true, false, false, true], 2, 2);
         assert_eq!(v.class, Class::Photo);
         assert_eq!((v.grid.nx, v.grid.ny, v.grid.bits), (2, 2, 0b1001));
