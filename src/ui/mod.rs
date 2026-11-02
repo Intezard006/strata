@@ -65,7 +65,7 @@ impl Canvas<'_> {
     }
 
     /// Source-over blit of premultiplied pixels (`tw` wide), clipped to the canvas and `clip_h` rows.
-    pub fn blit(&mut self, tw: i64, th: i64, src: &[u32], dx: i64, dy: i64, clip_h: i64, under: bool) {
+    pub fn blit(&mut self, tw: i64, th: i64, src: &[u32], dx: i64, dy: i64, clip_h: i64) {
         let (bw, bh) = (self.w as i64, (self.h as i64).min(clip_h));
         let (cx0, cx1) = (dx.max(0), (dx + tw).min(bw));
         let (cy0, cy1) = (dy.max(0), (dy + th).min(bh));
@@ -76,7 +76,7 @@ impl Canvas<'_> {
             let s_row = &src[((y - dy) * tw + (cx0 - dx)) as usize..][..(cx1 - cx0) as usize];
             let d_row = &mut self.buf[(y * bw + cx0) as usize..][..(cx1 - cx0) as usize];
             for (d, &s) in d_row.iter_mut().zip(s_row) {
-                *d = over(s, if under { 0xffff_ffff } else { *d });
+                *d = over(s, *d);
             }
         }
     }
@@ -112,10 +112,10 @@ mod tests {
         let mut buf = vec![0u32; 16];
         let mut cv = Canvas { buf: &mut buf, w: 4, h: 4 };
         let src = vec![0xffff_ffffu32; 9];
-        cv.blit(3, 3, &src, -1, 2, 4, false);
+        cv.blit(3, 3, &src, -1, 2, 4);
         assert_eq!(buf.iter().filter(|&&p| p != 0).count(), 4);
         let mut cv = Canvas { buf: &mut buf, w: 4, h: 4 };
-        cv.blit(3, 3, &src, 10, 10, 4, false);
+        cv.blit(3, 3, &src, 10, 10, 4);
     }
 
 }

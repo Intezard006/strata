@@ -92,7 +92,7 @@ pub fn tiles(page: usize, size: (f32, f32), g: &Geo, sx: f32, sy: f32, pw: i32, 
 }
 
 /// Draw the pane into `rect` (x, y, w, h) of the canvas: its background, then its tiles clipped to it.
-pub fn draw(cv: &mut Canvas, cache: &mut TileCache, p: &Pin, layout: &Layout, rect: (i32, i32, i32, i32), bg: u32, under: bool, focus_color: u32) {
+pub fn draw(cv: &mut Canvas, cache: &mut TileCache, p: &Pin, layout: &Layout, rect: (i32, i32, i32, i32), bg: u32, focus_color: u32) {
     let (rx, ry, rw, rh) = rect;
     let (x1, y1) = ((rx + rw).min(cv.w), (ry + rh).min(cv.h));
     for y in ry.max(0)..y1 {
@@ -101,14 +101,14 @@ pub fn draw(cv: &mut Canvas, cache: &mut TileCache, p: &Pin, layout: &Layout, re
     let g = geo(layout.size(p.page), p.region, rw as f32, p.mul);
     for (k, x, y) in tiles(p.page, layout.size(p.page), &g, p.sx, p.sy, rw, rh) {
         if let Some(t) = cache.get(&k) {
-            blit_clip(cv, t.w as i64, t.h as i64, &t.data, rx as i64 + x, ry as i64 + y, (rx as i64, ry as i64, x1 as i64, y1 as i64), under);
+            blit_clip(cv, t.w as i64, t.h as i64, &t.data, rx as i64 + x, ry as i64 + y, (rx as i64, ry as i64, x1 as i64, y1 as i64));
         }
     }
     cv.fill_rect(rx, ry, 2, rh, focus_color);
 }
 
 /// Source-over blit of premultiplied pixels clipped to `clip` (x0, y0, x1, y1).
-fn blit_clip(cv: &mut Canvas, tw: i64, th: i64, src: &[u32], dx: i64, dy: i64, clip: (i64, i64, i64, i64), under: bool) {
+fn blit_clip(cv: &mut Canvas, tw: i64, th: i64, src: &[u32], dx: i64, dy: i64, clip: (i64, i64, i64, i64)) {
     let (cx0, cx1) = (dx.max(clip.0), (dx + tw).min(clip.2));
     let (cy0, cy1) = (dy.max(clip.1), (dy + th).min(clip.3));
     if cx0 >= cx1 || cy0 >= cy1 {
@@ -118,7 +118,7 @@ fn blit_clip(cv: &mut Canvas, tw: i64, th: i64, src: &[u32], dx: i64, dy: i64, c
         let s_row = &src[((y - dy) * tw + (cx0 - dx)) as usize..][..(cx1 - cx0) as usize];
         let d_row = &mut cv.buf[(y * cv.w as i64 + cx0) as usize..][..(cx1 - cx0) as usize];
         for (d, &s) in d_row.iter_mut().zip(s_row) {
-            *d = super::over(s, if under { 0xffff_ffff } else { *d });
+            *d = super::over(s, *d);
         }
     }
 }
@@ -180,7 +180,7 @@ mod tests {
         let mut cv = Canvas { buf: &mut buf, w: 10, h: 10 };
         let src = vec![0xffff_ffffu32; 36];
         // a 6x6 tile starting left of the pane (x 4..10) and above it
-        blit_clip(&mut cv, 6, 6, &src, 1, -2, (4, 0, 10, 10), false);
+        blit_clip(&mut cv, 6, 6, &src, 1, -2, (4, 0, 10, 10));
         let lit: Vec<usize> = (0..100).filter(|&i| buf[i] != 0).collect();
         assert!(lit.iter().all(|i| i % 10 >= 4 && i % 10 < 7 && i / 10 < 4), "{lit:?}");
         assert_eq!(lit.len(), 3 * 4);

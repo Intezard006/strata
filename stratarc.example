@@ -3,6 +3,7 @@
 
 set default-bg           "#1e1e2e99"
 set recolor              true
+set original-paper       "#ffffff" # page colour when recolor is off (Ctrl-r); rgba(0,0,0,0) keeps pages transparent
 set recolor-lightcolor   "#1e1e2e"
 set recolor-darkcolor    "#ffffff"
 set recolor-keephue      false

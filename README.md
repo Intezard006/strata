@@ -20,6 +20,7 @@ page numbers, `:goto #120` to PDF page 120, `:goto xii` to front matter. `Ctrl-t
 `textbook`, or your own `profile NAME OPTION VALUE` lines). `gf` opens a small floating, pinned window with the current
 page (or the preview target) inside the same process; `strata --float FILE --page N` does the same from a script.
 Blurry scans: `recolor-contrast` (default 2.5, 1 = off) lifts grey ink towards solid for scans and line art (`recolor-contrast-vector true` for vector text too). Low-resolution images are upscaled smoothly when zoomed far in.
+`Ctrl-r` toggles recolor off for the original PDF look: no recolouring, image classification or contrast curve, and pages sit on an opaque `original-paper` (default `#ffffff`; `rgba(0,0,0,0)` keeps them transparent). Previews, pins and the float window follow; a profile switch (`Ctrl-t`) keeps recolor off unless the profile sets `recolor`.
 
 Mouse: `wheel-step` (px per notch), `touchpad-scroll-factor`, `wheel-zoom-step` (Ctrl+wheel; 0 = `zoom-step`).
 

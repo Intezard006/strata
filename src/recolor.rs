@@ -164,11 +164,13 @@ pub struct Recolor {
     pub contrast: f32,
     /// Apply the contrast curve to vector content (text, drawings) too.
     pub contrast_vector: bool,
+    /// Colour pages are composited over when recolor is off (alpha 0 keeps them transparent).
+    pub paper: [u8; 4],
 }
 
 impl Default for Recolor {
     fn default() -> Self {
-        Recolor { enabled: true, dark: [0xff, 0xff, 0xff], keephue: false, light: [0; 4], images: ImageMode::Smart, image_dim: 0.85, invert_dark: false, contrast: 1.0, contrast_vector: false }
+        Recolor { enabled: true, dark: [0xff, 0xff, 0xff], keephue: false, light: [0; 4], images: ImageMode::Smart, image_dim: 0.85, invert_dark: false, contrast: 1.0, contrast_vector: false, paper: [255; 4] }
     }
 }
 
@@ -210,6 +212,18 @@ fn invert_lightness(r: u32, g: u32, b: u32) -> [u32; 3] {
     let floor = 100.0;
     let t = if lum < floor { (floor - lum) / (255.0 - lum) } else { 0.0 };
     rgb.map(|v| (v + (255.0 - v) * t).round() as u32)
+}
+
+/// Premultiplied [r, g, b, a] of a straight-alpha colour.
+fn premul(c: [u8; 4]) -> [u32; 4] {
+    let a = c[3] as u32;
+    [mul255(c[0] as u32, a), mul255(c[1] as u32, a), mul255(c[2] as u32, a), a]
+}
+
+/// Premultiplied source pixel over a premultiplied paper colour.
+fn over_paper(s: &[u8], p: [u32; 4]) -> u32 {
+    let ia = 255 - s[3] as u32;
+    ((s[3] as u32 + mul255(p[3], ia)) << 24) | ((s[0] as u32 + mul255(p[0], ia)) << 16) | ((s[1] as u32 + mul255(p[1], ia)) << 8) | (s[2] as u32 + mul255(p[2], ia))
 }
 
 fn mul255(a: u32, b: u32) -> u32 {
@@ -296,6 +310,12 @@ impl Recolor {
 
     /// Convert one row of premultiplied RGBA bytes, applying `regions` (tile pixel coordinates) at row `y`.
     pub fn convert_row(&self, line: &[u8], y: i32, regions: &[Region], out: &mut Vec<u32>) {
+        if !self.enabled {
+            // original look: no regions, no curve; the page is composited over the paper colour
+            let p = premul(self.paper);
+            out.extend(line.chunks_exact(4).map(|s| over_paper(s, p)));
+            return;
+        }
         if !regions.iter().any(|r| y >= r.y0 && y < r.y1) {
             out.extend(line.chunks_exact(4).map(|p| self.pixel(p[0], p[1], p[2], p[3])));
             return;
@@ -534,6 +554,22 @@ mod tests {
     fn disabled_passes_through() {
         let rc = Recolor { enabled: false, ..Recolor::default() };
         assert_eq!(rc.pixel(10, 20, 30, 40), 0x280a_141e);
+    }
+
+    #[test]
+    fn disabled_composites_over_paper() {
+        let conv = |rc: &Recolor, px: [u8; 4]| {
+            let mut out = Vec::new();
+            rc.convert_row(&px, 0, &[], &mut out);
+            out[0]
+        };
+        let rc = Recolor { enabled: false, ..Recolor::default() };
+        assert_eq!(conv(&rc, [0, 0, 0, 0]), 0xffff_ffff);
+        assert_eq!(conv(&rc, [10, 20, 30, 255]), 0xff0a_141e);
+        assert_eq!(conv(&rc, [0, 0, 0, 128]), 0xff7f_7f7f);
+        let clear = Recolor { paper: [0; 4], ..rc };
+        assert_eq!(conv(&clear, [0, 0, 0, 0]), 0);
+        assert_eq!(conv(&clear, [10, 20, 30, 40]), 0x280a_141e);
     }
 
     #[test]

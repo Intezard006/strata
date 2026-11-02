@@ -1770,6 +1770,7 @@ impl App {
             Command::ToggleRecolor => {
                 self.cfg.recolor.enabled = !self.cfg.recolor.enabled;
                 self.apply_config();
+                self.msg(if self.cfg.recolor.enabled { "recolor: on" } else { "recolor: off (original)" }.into());
             }
             Command::ImageToggle => self.image_toggle(),
             Command::ToggleStatusbar => {
@@ -2695,7 +2696,6 @@ impl App {
         let search_pos = self.search.as_ref().map(|s| (s.index().map_or(0, |i| i + 1), s.hits.len(), s.done));
         let panel_bg = self.cfg.preview_bg;
         let bar_visible = self.cfg.statusbar && !self.in_float && !self.float_solo && self.present.is_none();
-        let under = !self.cfg.recolor.enabled;
         let bg = if self.present.is_some() { premultiply(self.cfg.presentation_bg) } else { self.bg };
         let shot = self.shot.take();
 
@@ -2708,8 +2708,8 @@ impl App {
         let mut cv = Canvas { buf: &mut buf, w: size.width as i32, h: size.height as i32 };
         for p in &vis {
             match self.cache.get(&p.key) {
-                Some(t) => cv.blit(t.w as i64, t.h as i64, &t.data, p.x, p.y, doc_h, under),
-                None => fallback(&mut cv, &self.cache, &self.layout, p, doc_h, under),
+                Some(t) => cv.blit(t.w as i64, t.h as i64, &t.data, p.x, p.y, doc_h),
+                None => fallback(&mut cv, &self.cache, &self.layout, p, doc_h),
             }
         }
         for &(x, y, ww, hh, cur) in &hl {
@@ -2724,7 +2724,7 @@ impl App {
         if let (Some(p), false, Some(win_w)) = (&self.pin, self.in_float, Some(size.width as i32)) {
             let rect = (self.vp.0 as i32, 0, win_w - self.vp.0 as i32, doc_h as i32);
             let focus = if p.focus { pm(crate::ui::ACCENT, 0xff) } else { pm(crate::ui::DIM, 0x80) };
-            crate::ui::pin::draw(&mut cv, &mut self.cache, p, &self.layout, rect, bg, under, focus);
+            crate::ui::pin::draw(&mut cv, &mut self.cache, p, &self.layout, rect, bg, focus);
         }
 
         let full_w = cv.w;
@@ -2826,7 +2826,7 @@ impl App {
 }
 
 /// Draw a stale tile (cached at another scale) scaled to stand in for a missing one.
-fn fallback(cv: &mut Canvas, cache: &TileCache, layout: &Layout, p: &Placed, doc_h: i64, under: bool) {
+fn fallback(cv: &mut Canvas, cache: &TileCache, layout: &Layout, p: &Placed, doc_h: i64) {
     let k = p.key;
     let Some(old) = cache.nearest_scale(k.page, k.scale) else { return };
     let size = layout.size(k.page as usize);
@@ -2852,7 +2852,7 @@ fn fallback(cv: &mut Canvas, cache: &TileCache, layout: &Layout, p: &Placed, doc
         for x in x0..x1 {
             let sx = (((x - p.x) as f32 * r) as usize).min(t.w as usize - 1);
             let i = (y * cv.w as i64 + x) as usize;
-            cv.buf[i] = over(row[sx], if under { 0xffff_ffff } else { cv.buf[i] });
+            cv.buf[i] = over(row[sx], cv.buf[i]);
         }
     }
 }

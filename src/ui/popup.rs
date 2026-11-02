@@ -175,7 +175,7 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup, bottom_reserve
             p.scroll = p.scroll.min(max_scroll);
             // clip to the body area by blitting into a sub-canvas row range
             let clip_bottom = body_y + body_h;
-            cv.blit(tile.w as i64, tile.h as i64, &tile.data, (x + PAD) as i64, (body_y - p.scroll + PAD / 2) as i64, clip_bottom as i64, false);
+            cv.blit(tile.w as i64, tile.h as i64, &tile.data, (x + PAD) as i64, (body_y - p.scroll + PAD / 2) as i64, clip_bottom as i64);
             if max_scroll > 0 {
                 let frac = p.scroll as f32 / max_scroll as f32;
                 let bar_h = (body_h as f32 * body_h as f32 / (tile.h as f32 + PAD as f32)).max(14.0) as i32;

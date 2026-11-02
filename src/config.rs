@@ -70,6 +70,10 @@ pub fn apply_profile(profiles: &[Profile], name: &str, base: &Config, cfg: &mut 
     touched.sort_unstable();
     touched.dedup();
     for o in touched {
+        // a look switch never re-enables recolor the user toggled off, unless the profile sets it
+        if o == "recolor" && !p.opts.iter().any(|q| q.0 == "recolor") {
+            continue;
+        }
         if let Some(v) = base.get(o) {
             let _ = cfg.set(o, &v);
         }
@@ -90,6 +94,7 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("cache-max-mb", "Cap for the on-disk analysis/OCR cache in MB (LRU eviction)"),
     ("default-bg", "Window background colour (#rrggbb, #rrggbbaa, rgba(r,g,b,a))"),
     ("recolor", "Recolor pages (true/false)"),
+    ("original-paper", "Page colour while recolor is off (Ctrl-r); rgba(0,0,0,0) keeps pages transparent"),
     ("recolor-lightcolor", "Paper colour; same RGB as default-bg keeps pages transparent"),
     ("recolor-darkcolor", "Ink colour"),
     ("recolor-keephue", "Keep the hue of coloured ink (true/false)"),
@@ -232,6 +237,7 @@ impl Config {
             "cache-max-mb" => self.cache_max_mb = parse_num(v, 16.0, 1_000_000.0)? as u64,
             "default-bg" => self.default_bg = parse_color(v)?,
             "recolor" => self.recolor.enabled = parse_bool(v)?,
+            "original-paper" => self.recolor.paper = parse_color(v)?,
             "recolor-lightcolor" => self.recolor.light = parse_color(v)?,
             "recolor-darkcolor" => {
                 let c = parse_color(v)?;
@@ -304,6 +310,7 @@ impl Config {
             "cache-max-mb" => self.cache_max_mb.to_string(),
             "default-bg" => fmt_color(self.default_bg),
             "recolor" => self.recolor.enabled.to_string(),
+            "original-paper" => fmt_color(self.recolor.paper),
             "recolor-lightcolor" => fmt_color(self.recolor.light),
             "recolor-darkcolor" => fmt_color([self.recolor.dark[0], self.recolor.dark[1], self.recolor.dark[2], 255]),
             "recolor-keephue" => self.recolor.keephue.to_string(),

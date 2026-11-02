@@ -150,7 +150,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("zoom", "PERCENT", "Set zoom to PERCENT"),
     ("fit-width", "", "Fit page width"),
     ("fit-page", "", "Fit whole page"),
-    ("toggle-recolor", "", "Toggle recolor"),
+    ("toggle-recolor", "", "Toggle between the recolored look and the original PDF (opaque original-paper page, no processing)"),
     ("present", "", "Presentation: fullscreen, one page at fit-page, no statusbar; j/k/Space/BackSpace/arrows/click change page, Esc/q/F5 end (option presentation-bg)"),
     ("book", "", "Toggle book mode: two-page spreads (options first-page-single, book-rtl); J/K move by spread"),
     ("image-toggle", "", "Cycle the image under the cursor (else the largest on screen) through keep / recolor / auto; saved per document"),
