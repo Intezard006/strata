@@ -69,7 +69,7 @@ fn image_job(file: &Path, cap_mb: u64) -> Result<(), String> {
                 // recolored whatever it contains, by geometry alone: no decoding, and nothing to
                 // remember (a 1000-page scan would otherwise add thousands of useless entries)
             } else if !matches!(known, Some(c) if c != imagemap::Class::Scan) {
-                map.set_class(pl.id, imagemap::classify(&pl.image, &cs));
+                map.set_verdict(pl.id, imagemap::classify(pl, &cs));
             }
         }
         drop(ps);

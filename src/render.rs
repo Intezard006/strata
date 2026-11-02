@@ -414,7 +414,7 @@ impl Renderer {
     fn smooth_threshold(page: &mupdf::Page, no: u32) -> f32 {
         imagemap::placements(page, no)
             .iter()
-            .map(|pl| 2.0 * pl.image.width() as f32 / (pl.rect[2] - pl.rect[0]).max(1.0))
+            .map(|pl| 2.0 * pl.image.width() as f32 / (pl.full[2] - pl.full[0]).max(1.0))
             .fold(f32::MAX, f32::min)
     }
 
@@ -913,7 +913,9 @@ pub fn dump_images(args: &[String]) -> std::process::ExitCode {
         let map = Mutex::new(ImageMap::detached());
         for im in collect_images(&page, p as u32, &cs, true, true, &map) {
             let share = (im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1]) / area;
-            println!("p{} {:?} share {:.2} dark {} line {} id {:016x}", p + 1, im.rect.map(|v| v.round()), share, im.dark, im.line, im.id);
+            let class = if im.grid.is_some() { "mixed" } else if im.line { "line" } else { "photo" };
+            let cells = if im.grid.is_some() { format!("{}x{} {}", im.grid.nx, im.grid.ny, im.grid.show()) } else { "-".into() };
+            println!("p{} {:?} share {:.2} dark {} class {} cells {} id {:016x}", p + 1, im.rect.map(|v| v.round()), share, im.dark, class, cells, im.id);
         }
     }
     std::process::ExitCode::SUCCESS
@@ -931,8 +933,10 @@ fn collect_images(page: &mupdf::Page, page_no: u32, cs: &Colorspace, measure: bo
     ps.iter()
         .map(|p| {
             let ovr = map.lock().map_or(Ovr::Auto, |m| m.ovr(p.id));
-            let line = classify && !scan_page && p.area() <= SCAN_SHARE * area && imagemap::class_of(map, p, cs) == Class::Line;
-            ImgRect { rect: p.rect, dark: measure && mean_luma(page, &b, p.rect, cs).is_some_and(|m| m < DARK_MEAN), line, id: p.id, ovr }
+            let big = scan_page || p.area() > SCAN_SHARE * area;
+            let v = if classify && !big { imagemap::verdict_of(map, p, cs) } else { imagemap::Verdict::plain(Class::Unknown) };
+            let dark = measure && mean_luma(page, &b, p.rect, cs).is_some_and(|m| m < DARK_MEAN);
+            ImgRect { rect: p.rect, dark, line: v.class == Class::Line, id: p.id, ovr, grid: v.grid }
         })
         .collect()
 }

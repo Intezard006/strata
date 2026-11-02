@@ -15,12 +15,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mupdf::{Colorspace, ColorParams, Device, IRect, Image, Matrix, Pixmap};
 
 /// Bump to reclassify every non-overridden image once.
-pub const CLASSIFIER_VERSION: u8 = 3;
+pub const CLASSIFIER_VERSION: u8 = 4;
 
 const MAGIC: &[u8; 4] = b"SIMG";
-const FORMAT: u8 = 1;
+/// Format 2 entries are 10 bytes (id, flags, version) plus 3 when the flags say the placement has a cell grid;
+/// format 1 (fixed 10 bytes, ids of whole streams) is still read, for its overrides.
+const FORMAT: u8 = 2;
 const HEADER: usize = 10;
-const ENTRY: usize = 10;
+const HAS_GRID: u8 = 16;
 /// Per page, as the renderer's own cap.
 pub const MAX_PER_PAGE: usize = 64;
 
@@ -76,9 +78,50 @@ impl Ovr {
     }
 }
 
+/// Per-cell classes of a mixed crop: `nx` x `ny` cells (each 1..=4; `nx == 0`: no grid), row-major,
+/// bit set = line art. Three bytes in memory and on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Grid {
+    pub nx: u8,
+    pub ny: u8,
+    pub bits: u16,
+}
+
+impl Grid {
+    pub const NONE: Grid = Grid { nx: 0, ny: 0, bits: 0 };
+
+    pub fn is_some(self) -> bool {
+        self.nx > 0 && self.ny > 0
+    }
+
+    pub fn line(self, cx: u8, cy: u8) -> bool {
+        self.bits >> (cy * self.nx + cx) & 1 != 0
+    }
+
+    /// `LLP/PPL`: rows top to bottom, `L` line art, `P` keeps its colours.
+    pub fn show(self) -> String {
+        (0..self.ny).map(|y| (0..self.nx).map(|x| if self.line(x, y) { 'L' } else { 'P' }).collect::<String>()).collect::<Vec<_>>().join("/")
+    }
+}
+
+/// What the classifier decided for a placement: a class, plus per-cell classes when the crop is mixed
+/// (then `class` is `Photo`, the conservative whole-placement answer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Verdict {
+    pub class: Class,
+    pub grid: Grid,
+}
+
+impl Verdict {
+    pub fn plain(class: Class) -> Verdict {
+        Verdict { class, grid: Grid::NONE }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub class: Class,
+    pub grid: Grid,
     /// Classifier version that produced `class`.
     pub ver: u8,
     pub ovr: Ovr,
@@ -118,7 +161,7 @@ fn brief_lock(dir: &Path) -> std::io::Result<std::fs::File> {
 fn encode(complete: u8, map: &HashMap<u64, Entry>) -> Vec<u8> {
     let mut ids: Vec<&u64> = map.keys().collect();
     ids.sort_unstable();
-    let mut out = Vec::with_capacity(HEADER + ids.len() * ENTRY);
+    let mut out = Vec::with_capacity(HEADER + ids.len() * 10);
     out.extend_from_slice(MAGIC);
     out.push(FORMAT);
     out.push(complete);
@@ -126,28 +169,48 @@ fn encode(complete: u8, map: &HashMap<u64, Entry>) -> Vec<u8> {
     for id in ids {
         let e = map[id];
         out.extend_from_slice(&id.to_le_bytes());
-        out.push(e.class as u8 | (e.ovr as u8) << 2);
+        out.push(e.class as u8 | (e.ovr as u8) << 2 | if e.grid.is_some() { HAS_GRID } else { 0 });
         out.push(e.ver);
+        if e.grid.is_some() {
+            out.push(e.grid.nx << 4 | e.grid.ny);
+            out.extend_from_slice(&e.grid.bits.to_le_bytes());
+        }
     }
     out
 }
 
 fn decode(b: &[u8]) -> Option<(u8, HashMap<u64, Entry>)> {
-    if b.len() < HEADER || &b[..4] != MAGIC || b[4] != FORMAT {
+    if b.len() < HEADER || &b[..4] != MAGIC || !(1..=FORMAT).contains(&b[4]) {
         return None;
     }
+    let v1 = b[4] == 1;
     let n = u32::from_le_bytes(b[6..10].try_into().ok()?) as usize;
-    if b.len() != HEADER + n * ENTRY {
-        return None;
+    let mut map = HashMap::with_capacity(n.min(1 << 20));
+    let mut at = HEADER;
+    for _ in 0..n {
+        let c = b.get(at..at + 10)?;
+        at += 10;
+        let id = u64::from_le_bytes(c[..8].try_into().unwrap());
+        let mut e = Entry { class: Class::from_bits(c[8]), grid: Grid::NONE, ovr: Ovr::from_bits(c[8] >> 2), ver: c[9] };
+        if !v1 && c[8] & HAS_GRID != 0 {
+            let g = b.get(at..at + 3)?;
+            at += 3;
+            e.grid = Grid { nx: g[0] >> 4, ny: g[0] & 15, bits: u16::from_le_bytes([g[1], g[2]]) };
+            if !e.grid.is_some() || e.grid.nx > 4 || e.grid.ny > 4 {
+                return None;
+            }
+        }
+        if v1 {
+            // whole-stream ids of the old scheme no longer match placements; only overrides are worth keeping
+            if e.ovr == Ovr::Auto {
+                continue;
+            }
+            e.class = Class::Unknown;
+            e.ver = 0;
+        }
+        map.insert(id, e);
     }
-    let map = b[HEADER..]
-        .chunks_exact(ENTRY)
-        .map(|c| {
-            let id = u64::from_le_bytes(c[..8].try_into().unwrap());
-            (id, Entry { class: Class::from_bits(c[8]), ovr: Ovr::from_bits(c[8] >> 2), ver: c[9] })
-        })
-        .collect();
-    Some((b[5], map))
+    (at == b.len()).then_some((b[5], map))
 }
 
 /// Merge the entries `mine` marked in `pending` into `base`.
@@ -158,11 +221,12 @@ fn decode(b: &[u8]) -> Option<(u8, HashMap<u64, Entry>)> {
 fn merge(base: &mut HashMap<u64, Entry>, mine: &HashMap<u64, Entry>, pending: &HashMap<u64, u8>) {
     for (id, &flags) in pending {
         let Some(m) = mine.get(id) else { continue };
-        let mut b = base.get(id).copied().unwrap_or(Entry { class: Class::Unknown, ver: 0, ovr: Ovr::Auto });
+        let mut b = base.get(id).copied().unwrap_or(Entry { class: Class::Unknown, grid: Grid::NONE, ver: 0, ovr: Ovr::Auto });
         if flags & CLASS_DIRTY != 0 && m.class != Class::Unknown {
             let replace = b.class == Class::Unknown || b.ver < m.ver || (b.ver == m.ver && b.class == Class::Scan && m.class != Class::Scan);
             if replace {
                 b.class = m.class;
+                b.grid = m.grid;
                 b.ver = m.ver;
             }
         }
@@ -199,19 +263,30 @@ impl ImageMap {
         self.map.get(&id).filter(|e| e.ver == CLASSIFIER_VERSION && e.class != Class::Unknown).map(|e| e.class)
     }
 
+    /// The cell grid of a mixed crop classified by the current classifier.
+    pub fn grid(&self, id: u64) -> Grid {
+        self.map.get(&id).filter(|e| e.ver == CLASSIFIER_VERSION).map_or(Grid::NONE, |e| e.grid)
+    }
+
     pub fn ovr(&self, id: u64) -> Ovr {
         self.map.get(&id).map_or(Ovr::Auto, |e| e.ovr)
     }
 
+    #[cfg(test)]
     pub fn set_class(&mut self, id: u64, class: Class) {
-        let e = self.map.entry(id).or_insert(Entry { class, ver: CLASSIFIER_VERSION, ovr: Ovr::Auto });
-        e.class = class;
+        self.set_verdict(id, Verdict::plain(class));
+    }
+
+    pub fn set_verdict(&mut self, id: u64, v: Verdict) {
+        let e = self.map.entry(id).or_insert(Entry { class: v.class, grid: v.grid, ver: CLASSIFIER_VERSION, ovr: Ovr::Auto });
+        e.class = v.class;
+        e.grid = v.grid;
         e.ver = CLASSIFIER_VERSION;
         *self.pending.entry(id).or_default() |= CLASS_DIRTY;
     }
 
     pub fn set_ovr(&mut self, id: u64, ovr: Ovr) {
-        let e = self.map.entry(id).or_insert(Entry { class: Class::Unknown, ver: 0, ovr });
+        let e = self.map.entry(id).or_insert(Entry { class: Class::Unknown, grid: Grid::NONE, ver: 0, ovr });
         e.ovr = ovr;
         *self.pending.entry(id).or_default() |= OVR_DIRTY;
     }
@@ -326,8 +401,10 @@ fn raw(img: &Image) -> *mut mupdf_sys::fz_image {
     unsafe { std::mem::transmute_copy::<Image, *mut mupdf_sys::fz_image>(img) }
 }
 
-/// Id of `img` placed at `rect` on `page`.
-pub fn image_id(img: &Image, page: u32, rect: [f32; 4]) -> u64 {
+/// Id of `img` drawn at `full`, of which `vis` is visible. A placement shown whole keeps the plain stream id
+/// (shared by every use of the image); a crop mixes in the visible rectangle, so two crops of one image
+/// get separate classes and overrides.
+pub fn image_id(img: &Image, page: u32, vis: [f32; 4], full: [f32; 4]) -> u64 {
     let c = ctx();
     if !c.is_null() {
         unsafe {
@@ -336,45 +413,209 @@ pub fn image_id(img: &Image, page: u32, rect: [f32; 4]) -> u64 {
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let n = mupdf_sys::fz_buffer_storage(c, (*cb).buffer, &mut data);
                 if !data.is_null() && n > 0 {
-                    return stream_id(img.width(), img.height(), std::slice::from_raw_parts(data, n));
+                    let id = stream_id(img.width(), img.height(), std::slice::from_raw_parts(data, n));
+                    return if vis.iter().zip(full).all(|(a, b)| (a - b).abs() < 2.0) { id } else { crop_id(id, vis) };
                 }
             }
         }
     }
-    placement_id(page, rect, img.width(), img.height())
+    placement_id(page, vis, img.width(), img.height())
+}
+
+/// Id of the crop `vis` (points, page origin) of the image with stream id `id`.
+pub fn crop_id(id: u64, vis: [f32; 4]) -> u64 {
+    let mut b = [0u8; 16];
+    for (i, v) in vis.iter().enumerate() {
+        b[i * 4..i * 4 + 4].copy_from_slice(&(v.round() as i32).to_le_bytes());
+    }
+    hash_bytes(id, &b) & !(1 << 63)
 }
 
 // ---- placements and classification -------------------------------------------------------------
 
 /// An image placement on a page (points from the page origin).
 pub struct Placement {
+    /// The visible part: image rect, clipped by the clip in effect and the page.
     pub rect: [f32; 4],
+    /// The image's whole rectangle (may extend past the page).
+    pub full: [f32; 4],
+    /// Image space (unit square) to page points.
+    pub ctm: [f32; 6],
     pub id: u64,
     pub image: Image,
 }
 
 impl Placement {
+    /// Visible area.
     pub fn area(&self) -> f32 {
         (self.rect[2] - self.rect[0]) * (self.rect[3] - self.rect[1])
     }
 }
 
-/// Image placements of a page via the structured-text device (images are referenced, not decoded).
+type Rect = [f32; 4];
+
+fn isect(a: Rect, b: Rect) -> Rect {
+    [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])]
+}
+
+fn from_fz(r: mupdf_sys::fz_rect) -> Rect {
+    [r.x0, r.y0, r.x1, r.y1]
+}
+
+/// Bounding box of the unit square under `m`.
+fn unit_bbox(m: &mupdf_sys::fz_matrix) -> Rect {
+    let xs = [m.e, m.a + m.e, m.c + m.e, m.a + m.c + m.e];
+    let ys = [m.f, m.b + m.f, m.d + m.f, m.b + m.d + m.f];
+    [xs.iter().cloned().fold(f32::MAX, f32::min), ys.iter().cloned().fold(f32::MAX, f32::min), xs.iter().cloned().fold(f32::MIN, f32::max), ys.iter().cloned().fold(f32::MIN, f32::max)]
+}
+
+/// A MuPDF device that does nothing but track the clip stack and note each drawn image with the clip in
+/// effect. Pages are run through it without decoding anything.
+#[repr(C)]
+struct Rec {
+    dev: mupdf_sys::fz_device,
+    stack: Vec<Rect>,
+    mask_area: Rect,
+    found: Vec<(*mut mupdf_sys::fz_image, [f32; 6], Rect)>,
+}
+
+type Ctx = *mut mupdf_sys::fz_context;
+type Dev = *mut mupdf_sys::fz_device;
+type Fz = mupdf_sys::fz_matrix;
+
+unsafe fn rec<'a>(d: Dev) -> &'a mut Rec {
+    unsafe { &mut *(d as *mut Rec) }
+}
+
+fn top(r: &Rec) -> Rect {
+    r.stack.last().copied().unwrap_or([f32::MIN, f32::MIN, f32::MAX, f32::MAX])
+}
+
+fn push(r: &mut Rec, b: Rect) {
+    let t = isect(top(r), b);
+    r.stack.push(t);
+}
+
+unsafe extern "C" fn cb_drop(c: Ctx, d: Dev) {
+    unsafe {
+        let r = rec(d);
+        for &(img, _, _) in &r.found {
+            mupdf_sys::fz_drop_image(c, img);
+        }
+        std::ptr::drop_in_place(&mut r.found);
+        std::ptr::drop_in_place(&mut r.stack);
+    }
+}
+
+unsafe extern "C" fn cb_fill_image(c: Ctx, d: Dev, img: *mut mupdf_sys::fz_image, m: Fz, _a: f32, _p: mupdf_sys::fz_color_params) {
+    unsafe {
+        let r = rec(d);
+        if r.found.len() >= MAX_PER_PAGE * 4 {
+            return;
+        }
+        let vis = isect(top(r), unit_bbox(&m));
+        if vis[2] - vis[0] < 4.0 || vis[3] - vis[1] < 4.0 {
+            return; // rules and bullets drawn as images, or nothing visible
+        }
+        r.found.push((mupdf_sys::fz_keep_image(c, img), [m.a, m.b, m.c, m.d, m.e, m.f], top(r)));
+    }
+}
+
+unsafe extern "C" fn cb_clip_path(c: Ctx, d: Dev, p: *const mupdf_sys::fz_path, _eo: i32, m: Fz, _s: mupdf_sys::fz_rect) {
+    unsafe { push(rec(d), from_fz(mupdf_sys::fz_bound_path(c, p, std::ptr::null(), m))) }
+}
+
+unsafe extern "C" fn cb_clip_stroke_path(c: Ctx, d: Dev, p: *const mupdf_sys::fz_path, st: *const mupdf_sys::fz_stroke_state, m: Fz, _s: mupdf_sys::fz_rect) {
+    unsafe { push(rec(d), from_fz(mupdf_sys::fz_bound_path(c, p, st, m))) }
+}
+
+unsafe extern "C" fn cb_clip_text(c: Ctx, d: Dev, t: *const mupdf_sys::fz_text, m: Fz, _s: mupdf_sys::fz_rect) {
+    unsafe { push(rec(d), from_fz(mupdf_sys::fz_bound_text(c, t, std::ptr::null(), m))) }
+}
+
+unsafe extern "C" fn cb_clip_stroke_text(c: Ctx, d: Dev, t: *const mupdf_sys::fz_text, st: *const mupdf_sys::fz_stroke_state, m: Fz, _s: mupdf_sys::fz_rect) {
+    unsafe { push(rec(d), from_fz(mupdf_sys::fz_bound_text(c, t, st, m))) }
+}
+
+unsafe extern "C" fn cb_clip_image_mask(_c: Ctx, d: Dev, _i: *mut mupdf_sys::fz_image, m: Fz, _s: mupdf_sys::fz_rect) {
+    unsafe { push(rec(d), unit_bbox(&m)) }
+}
+
+unsafe extern "C" fn cb_pop_clip(_c: Ctx, d: Dev) {
+    unsafe {
+        rec(d).stack.pop();
+    }
+}
+
+unsafe extern "C" fn cb_begin_mask(_c: Ctx, d: Dev, area: mupdf_sys::fz_rect, _l: i32, _cs: *mut mupdf_sys::fz_colorspace, _bc: *const f32, _p: mupdf_sys::fz_color_params) {
+    unsafe { rec(d).mask_area = from_fz(area) }
+}
+
+unsafe extern "C" fn cb_end_mask(_c: Ctx, d: Dev, _f: *mut mupdf_sys::fz_function) {
+    unsafe {
+        let r = rec(d);
+        let a = r.mask_area;
+        push(r, a); // the mask is a clip until the matching pop_clip
+    }
+}
+
+/// Image draws of a page with the clip in effect: (image, matrix, clip), in page points from the origin.
+fn run_recorder(page: &mupdf::Page, b: &mupdf::Rect) -> Vec<(Image, [f32; 6], Rect)> {
+    const _: () = assert!(std::mem::size_of::<mupdf::Page>() == std::mem::size_of::<usize>());
+    let c = ctx();
+    if c.is_null() {
+        return Vec::new();
+    }
+    let page_rect = [0.0, 0.0, b.x1 - b.x0, b.y1 - b.y0];
+    unsafe {
+        let d = mupdf_sys::fz_new_device_of_size(c, std::mem::size_of::<Rec>() as i32);
+        if d.is_null() {
+            return Vec::new();
+        }
+        let r = rec(d);
+        std::ptr::write(&mut r.stack, vec![page_rect]);
+        std::ptr::write(&mut r.mask_area, page_rect);
+        std::ptr::write(&mut r.found, Vec::new());
+        (*d).drop_device = Some(cb_drop);
+        (*d).fill_image = Some(cb_fill_image);
+        (*d).clip_path = Some(cb_clip_path);
+        (*d).clip_stroke_path = Some(cb_clip_stroke_path);
+        (*d).clip_text = Some(cb_clip_text);
+        (*d).clip_stroke_text = Some(cb_clip_stroke_text);
+        (*d).clip_image_mask = Some(cb_clip_image_mask);
+        (*d).pop_clip = Some(cb_pop_clip);
+        (*d).begin_mask = Some(cb_begin_mask);
+        (*d).end_mask = Some(cb_end_mask);
+        let pg = std::mem::transmute_copy::<mupdf::Page, *mut mupdf_sys::fz_page>(page);
+        let m = Fz { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: -b.x0, f: -b.y0 };
+        let mut err: *mut mupdf_sys::mupdf_error_t = std::ptr::null_mut();
+        mupdf_sys::mupdf_run_page(c, pg, d, m, std::ptr::null_mut(), &mut err);
+        if !err.is_null() {
+            mupdf_sys::mupdf_drop_error(err);
+        }
+        mupdf_sys::fz_close_device(c, d);
+        let found = std::mem::take(&mut rec(d).found); // ownership of the image references moves to the Images
+        mupdf_sys::fz_drop_device(c, d);
+        found
+            .into_iter()
+            .map(|(p, m, clip)| (std::mem::transmute_copy::<*mut mupdf_sys::fz_image, Image>(&p), m, clip))
+            .collect()
+    }
+}
+
+/// Image placements of a page, each with its visible rect (image rect, clip in effect and page bounds
+/// intersected). Images are referenced, not decoded.
 pub fn placements(page: &mupdf::Page, page_no: u32) -> Vec<Placement> {
     let Ok(b) = page.bounds() else { return Vec::new() };
-    let Ok(tp) = page.to_text_page(mupdf::TextPageFlags::PRESERVE_IMAGES) else { return Vec::new() };
+    let page_rect = [0.0, 0.0, b.x1 - b.x0, b.y1 - b.y0];
     let mut out = Vec::new();
-    for blk in tp.blocks() {
-        if blk.r#type() != mupdf::text_page::TextBlockType::Image {
+    for (image, m, clip) in run_recorder(page, &b) {
+        let full = unit_bbox(&Fz { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5] });
+        let rect = isect(isect(full, clip), page_rect);
+        if rect[2] - rect[0] < 4.0 || rect[3] - rect[1] < 4.0 {
             continue;
         }
-        let r = blk.bounds();
-        let rect = [r.x0 - b.x0, r.y0 - b.y0, r.x1 - b.x0, r.y1 - b.y0];
-        if rect[2] - rect[0] < 4.0 || rect[3] - rect[1] < 4.0 {
-            continue; // rules and bullets drawn as images
-        }
-        let Some(image) = blk.image() else { continue };
-        out.push(Placement { rect, id: image_id(&image, page_no, rect), image });
+        out.push(Placement { rect, full, ctm: m, id: image_id(&image, page_no, rect, full), image });
         if out.len() >= MAX_PER_PAGE {
             break;
         }
@@ -387,64 +628,101 @@ pub fn is_scan_page(ps: &[Placement], page_area: f32) -> bool {
     ps.iter().any(|p| p.area() > crate::recolor::SCAN_SHARE * page_area)
 }
 
-/// Classify the whole image (not a tile of it, so the result does not depend on zoom): drawn alone onto
-/// a white 96 px thumbnail, which makes MuPDF decode it subsampled instead of at full size.
-pub fn classify(img: &Image, cs: &Colorspace) -> Class {
+/// Longest side of the classification thumbnail, pixels.
+const THUMB: f32 = 192.0;
+/// A grid cell is at least this many points on a side, and a grid has at most `MAX_CELLS` per side.
+pub const MIN_CELL: f32 = 48.0;
+const MAX_CELLS: usize = 4;
+
+/// Grid size for a visible rect of `w` x `h` points.
+pub fn grid_dims(w: f32, h: f32) -> (usize, usize) {
+    let n = |v: f32| ((v / MIN_CELL) as usize).clamp(1, MAX_CELLS);
+    (n(w), n(h))
+}
+
+/// Combine per-cell line flags (row-major, `nx` x `ny`): uniform cells give a plain class, a mix a grid.
+pub fn verdict_from_cells(cells: &[bool], nx: usize, ny: usize) -> Verdict {
+    if cells.iter().all(|&c| c) {
+        return Verdict::plain(Class::Line);
+    }
+    if !cells.iter().any(|&c| c) {
+        return Verdict::plain(Class::Photo);
+    }
+    let bits = cells.iter().enumerate().fold(0u16, |a, (i, &c)| a | (c as u16) << i);
+    Verdict { class: Class::Photo, grid: Grid { nx: nx as u8, ny: ny as u8, bits } }
+}
+
+/// Classify the visible crop of a placement (not the whole stream, and not per tile, so the result does not
+/// depend on zoom): the image drawn as placed onto a white thumbnail of the visible rect, which makes MuPDF
+/// decode it subsampled. A crop of mixed content is judged per cell of a coarse grid.
+pub fn classify(p: &Placement, cs: &Colorspace) -> Verdict {
     CLASSIFY_CALLS.fetch_add(1, Ordering::Relaxed);
+    let img = &p.image;
     if std::env::var_os("STRATA_DEBUG").is_some() {
-        eprintln!("imagemap: classifying {}x{} image", img.width(), img.height());
+        eprintln!("imagemap: classifying {}x{} image crop {:?}", img.width(), img.height(), p.rect);
     }
     if img.color_space().is_none() {
-        return Class::Line; // a 1-bit stencil: ink by definition
+        return Verdict::plain(Class::Line); // a 1-bit stencil: ink by definition
     }
-    let (w, h) = (img.width().max(1) as f32, img.height().max(1) as f32);
-    let s = (96.0 / w.max(h)).min(1.0);
+    let photo = Verdict::plain(Class::Photo);
+    let v = p.rect;
+    let (w, h) = (v[2] - v[0], v[3] - v[1]);
+    let s = (THUMB / w.max(h)).min(2.0);
     let (pw, ph) = ((w * s).ceil().max(1.0) as i32, (h * s).ceil().max(1.0) as i32);
-    let Ok(mut pix) = Pixmap::new_with_rect(cs, IRect::new(0, 0, pw, ph), false) else { return Class::Photo };
+    let Ok(mut pix) = Pixmap::new_with_rect(cs, IRect::new(0, 0, pw, ph), false) else { return photo };
     if pix.clear_with(255).is_err() {
-        return Class::Photo;
+        return photo;
     }
     {
-        let Ok(dev) = Device::from_pixmap(&pix) else { return Class::Photo };
-        let m = Matrix::new(pw as f32, 0.0, 0.0, ph as f32, 0.0, 0.0);
+        let Ok(dev) = Device::from_pixmap(&pix) else { return photo };
+        let c = p.ctm;
+        let m = Matrix::new(s * c[0], s * c[1], s * c[2], s * c[3], s * (c[4] - v[0]), s * (c[5] - v[1]));
         // a soft mask (logos with a transparent surround) must apply, or the hidden pixels behind it are judged
         let mask = img.mask();
         if mask.as_ref().is_some_and(|k| dev.clip_image_mask(k, &m).is_err()) {
-            return Class::Photo;
+            return photo;
         }
         let ok = dev.fill_image(img, &m, 1.0, ColorParams::default()).is_ok();
         if mask.is_some() {
             let _ = dev.pop_clip();
         }
         if !ok {
-            return Class::Photo;
+            return photo;
         }
     }
     let n = pix.n() as usize;
     let (stride, sm) = (pix.stride() as usize, pix.samples());
-    let st = crate::recolor::line_stats((0..ph as usize).flat_map(|y| (0..pw as usize).map(move |x| (x, y))).map(|(x, y)| {
-        let p = &sm[y * stride + x * n..];
-        [p[0], p[1], p[2]]
-    }));
-    if std::env::var_os("STRATA_DEBUG").is_some() {
-        eprintln!("imagemap: stats {st:?}");
-    }
-    let line = st.is_some_and(|s| s.is_line());
-    if line { Class::Line } else { Class::Photo }
-}
-
-/// Class of a placement: from the map if known, else classified (and recorded). `Scan` is by geometry.
-pub fn class_of(map: &std::sync::Mutex<ImageMap>, p: &Placement, cs: &Colorspace) -> Class {
-    if let Some(c) = map.lock().ok().and_then(|m| m.class(p.id)) {
-        if c != Class::Scan {
-            return c;
+    let (nx, ny) = grid_dims(w, h);
+    let mut cells = Vec::with_capacity(nx * ny);
+    for cy in 0..ny {
+        for cx in 0..nx {
+            let (x0, x1) = (cx * pw as usize / nx, (cx + 1) * pw as usize / nx);
+            let (y0, y1) = (cy * ph as usize / ny, (cy + 1) * ph as usize / ny);
+            let st = crate::recolor::line_stats((y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| {
+                let q = &sm[y * stride + x * n..];
+                [q[0], q[1], q[2]]
+            }));
+            if std::env::var_os("STRATA_DEBUG").is_some() {
+                eprintln!("imagemap: cell {cx},{cy} stats {st:?}");
+            }
+            cells.push(st.is_some_and(|s| s.is_line()));
         }
     }
-    let c = classify(&p.image, cs);
-    if let Ok(mut m) = map.lock() {
-        m.set_class(p.id, c);
+    verdict_from_cells(&cells, nx, ny)
+}
+
+/// Verdict for a placement: from the map if known, else classified (and recorded). `Scan` is by geometry.
+pub fn verdict_of(map: &std::sync::Mutex<ImageMap>, p: &Placement, cs: &Colorspace) -> Verdict {
+    if let Some(v) = map.lock().ok().and_then(|m| m.class(p.id).map(|class| Verdict { class, grid: m.grid(p.id) })) {
+        if v.class != Class::Scan {
+            return v;
+        }
     }
-    c
+    let v = classify(p, cs);
+    if let Ok(mut m) = map.lock() {
+        m.set_verdict(p.id, v);
+    }
+    v
 }
 
 /// Next override in the cycle for an image whose automatic look is `auto_recolored`:
@@ -502,7 +780,7 @@ mod tests {
         m.mark_complete();
         m.sync().unwrap();
         assert!(!m.is_dirty());
-        assert_eq!(std::fs::metadata(map_path(&d)).unwrap().len() as usize, HEADER + 4 * ENTRY);
+        assert_eq!(std::fs::metadata(map_path(&d)).unwrap().len() as usize, HEADER + 4 * 10);
         let l = ImageMap::load(&d);
         assert_eq!(l.class(1), Some(Class::Line));
         assert_eq!(l.class(2), Some(Class::Photo));
@@ -545,8 +823,8 @@ mod tests {
     #[test]
     fn version_bump_reclassifies_but_keeps_overrides() {
         let mut base: HashMap<u64, Entry> = HashMap::new();
-        base.insert(1, Entry { class: Class::Line, ver: CLASSIFIER_VERSION - 1, ovr: Ovr::Auto });
-        base.insert(2, Entry { class: Class::Line, ver: CLASSIFIER_VERSION - 1, ovr: Ovr::Keep });
+        base.insert(1, Entry { class: Class::Line, grid: Grid::NONE, ver: CLASSIFIER_VERSION - 1, ovr: Ovr::Auto });
+        base.insert(2, Entry { class: Class::Line, grid: Grid::NONE, ver: CLASSIFIER_VERSION - 1, ovr: Ovr::Keep });
         // loaded from an older version: not a valid classification any more
         let mut m = ImageMap { map: base.clone(), ..Default::default() };
         assert_eq!(m.class(1), None);
@@ -604,5 +882,96 @@ mod tests {
         assert_eq!(next_override(Ovr::Auto, false), Ovr::Recolor);
         assert_eq!(next_override(Ovr::Recolor, false), Ovr::Keep);
         assert_eq!(next_override(Ovr::Keep, false), Ovr::Auto);
+    }
+
+    /// A 300x300 pt page: a 4x4 image (top half white, bottom half dark grey) at pdf (0,50)-(200,250) drawn
+    /// three times: clipped to its top half, clipped to its bottom half, and whole.
+    fn deck() -> Vec<u8> {
+        let img = "FFFFFFFF FFFFFFFF 20202020 20202020>";
+        let content = "q 0 150 200 100 re W n 200 0 0 200 0 50 cm /Im Do Q\n\
+                       q 0 50 200 100 re W n 200 0 0 200 0 50 cm /Im Do Q\n\
+                       q 200 0 0 200 0 50 cm /Im Do Q\n";
+        format!(
+            "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
+             3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 300]/Resources<</XObject<</Im 4 0 R>>>>/Contents 5 0 R>>endobj\n\
+             4 0 obj<</Type/XObject/Subtype/Image/Width 4/Height 4/ColorSpace/DeviceGray/BitsPerComponent 8/Filter/ASCIIHexDecode/Length {}>>stream\n{img}\nendstream endobj\n\
+             5 0 obj<</Length {}>>stream\n{content}endstream endobj\ntrailer<</Root 1 0 R>>\n",
+            img.len(),
+            content.len()
+        )
+        .into_bytes()
+    }
+
+    fn near(a: [f32; 4], b: [f32; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1.0)
+    }
+
+    #[test]
+    fn placements_are_clipped_and_classified_by_crop() {
+        let doc = mupdf::Document::from_bytes(&deck(), "application/pdf").unwrap();
+        let page = doc.load_page(0).unwrap();
+        let ps = placements(&page, 0);
+        assert_eq!(ps.len(), 3);
+        // pdf y is up: the top half of the image is page y 50..150
+        assert!(near(ps[0].rect, [0.0, 50.0, 200.0, 150.0]), "{:?}", ps[0].rect);
+        assert!(near(ps[1].rect, [0.0, 150.0, 200.0, 250.0]), "{:?}", ps[1].rect);
+        assert!(near(ps[2].rect, [0.0, 50.0, 200.0, 250.0]));
+        assert!(ps.iter().all(|p| near(p.full, [0.0, 50.0, 200.0, 250.0])));
+        // crops of one stream get separate ids; the whole image keeps the plain stream id
+        assert!(ps[0].id != ps[1].id && ps[1].id != ps[2].id && ps[0].id != ps[2].id);
+        assert_eq!(ps[2].id & (1 << 63), 0);
+        let cs = Colorspace::device_rgb();
+        assert_eq!(classify(&ps[0], &cs), Verdict::plain(Class::Line));
+        assert_eq!(classify(&ps[1], &cs), Verdict::plain(Class::Photo));
+        let v = classify(&ps[2], &cs);
+        assert_eq!(v.grid, Grid { nx: 4, ny: 4, bits: 0x00ff });
+        assert_eq!(v.grid.show(), "LLLL/LLLL/PPPP/PPPP");
+    }
+
+    #[test]
+    fn page_bounds_clip_the_visible_rect() {
+        let bytes = String::from_utf8(deck()).unwrap().replace("0 50 cm /Im Do Q\nq 0 50", "-100 50 cm /Im Do Q\nq 0 50");
+        let doc = mupdf::Document::from_bytes(bytes.as_bytes(), "application/pdf").unwrap();
+        let ps = placements(&doc.load_page(0).unwrap(), 0);
+        assert!(ps.iter().all(|p| p.rect[0] >= 0.0 && p.rect[2] <= 300.0));
+    }
+
+    #[test]
+    fn cells_combine_into_a_grid_only_when_mixed() {
+        assert_eq!(verdict_from_cells(&[true; 6], 3, 2), Verdict::plain(Class::Line));
+        assert_eq!(verdict_from_cells(&[false; 4], 2, 2), Verdict::plain(Class::Photo));
+        let v = verdict_from_cells(&[true, false, false, true], 2, 2);
+        assert_eq!(v.class, Class::Photo);
+        assert_eq!((v.grid.nx, v.grid.ny, v.grid.bits), (2, 2, 0b1001));
+        assert_eq!(grid_dims(30.0, 500.0), (1, 4));
+        assert_eq!(grid_dims(100.0, 100.0), (2, 2));
+    }
+
+    #[test]
+    fn grid_round_trips_and_old_files_keep_only_overrides() {
+        let d = tmpdir("grid");
+        let mut m = ImageMap::load(&d);
+        m.set_verdict(5, Verdict { class: Class::Photo, grid: Grid { nx: 3, ny: 2, bits: 0b101101 } });
+        m.set_class(6, Class::Line);
+        m.set_ovr(6, Ovr::Keep);
+        m.sync().unwrap();
+        let bytes = std::fs::read(map_path(&d)).unwrap();
+        assert_eq!(bytes.len(), HEADER + 13 + 10); // only the gridded entry pays for its cells
+        let l = ImageMap::load(&d);
+        assert_eq!(l.grid(5), Grid { nx: 3, ny: 2, bits: 0b101101 });
+        assert_eq!(l.grid(6), Grid::NONE);
+        assert_eq!((l.class(5), l.class(6), l.ovr(6)), (Some(Class::Photo), Some(Class::Line), Ovr::Keep));
+        // a format-1 file: classes are dropped (stale ids), overrides survive
+        let mut v1 = b"SIMG".to_vec();
+        v1.extend_from_slice(&[1, 3]);
+        v1.extend_from_slice(&2u32.to_le_bytes());
+        for (id, flags) in [(7u64, 1u8), (8, 1 | 2 << 2)] {
+            v1.extend_from_slice(&id.to_le_bytes());
+            v1.extend_from_slice(&[flags, 3]);
+        }
+        std::fs::write(map_path(&d), v1).unwrap();
+        let l = ImageMap::load(&d);
+        assert_eq!((l.len(), l.class(8), l.ovr(8)), (1, None, Ovr::Keep));
+        let _ = std::fs::remove_dir_all(d);
     }
 }
