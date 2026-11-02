@@ -37,9 +37,11 @@ use crate::ext::{self, Ext, SharedInfo};
 use crate::synctex;
 use crate::pages;
 use crate::ui::popup::{self, Popup};
+use crate::ui::pin::Pin;
 use crate::ui::select::{self, Ch, Highlight, Selection};
 
 mod hl;
+mod pin;
 pub use hl::write_highlights;
 use crate::ui::index::{self, Index, Item};
 use crate::worker::{Job, Msg};
@@ -282,6 +284,9 @@ pub struct App {
     snip_id: u64,
     /// The armed or running snip is for OCR.
     snip_text: bool,
+    /// The pin pane (right-hand split) and the tiles it wants.
+    pin: Option<Pin>,
+    wanted_pin: Vec<TileKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -406,6 +411,8 @@ impl App {
             snip_armed: false,
             snip_id: 0,
             snip_text: false,
+            pin: None,
+            wanted_pin: Vec::new(),
         };
         app.load_hl_flag();
         app.load_config();
@@ -1086,6 +1093,7 @@ impl App {
     fn sync_wanted(&self) {
         let mut w = self.wanted_main.clone();
         w.extend(self.wanted_float.iter().copied());
+        w.extend(self.wanted_pin.iter().copied());
         *self.render.wanted.lock().unwrap() = w;
     }
 
@@ -1370,6 +1378,9 @@ impl App {
                 self.mouse_button(MouseButton::Left);
             }
             Ext::Exec(line) if debug() && line.starts_with("debug-state") => {
+                if let Some(p) = &self.pin {
+                    eprintln!("debug-pin: page {} mul {} sx {} sy {} focus {} pending {} key {:?}", p.page, p.mul, p.sx, p.sy, p.focus, p.pending.len(), self.pin_scale_key());
+                }
                 eprintln!("debug-state: page {} sy {} sx {} zoom {} vp {:?} book {} len {} present {} tiles {} pending {}", self.current_page() + 1, self.sy, self.sx, self.zoom, self.vp, self.book, self.layout.len(), self.present.is_some(), self.cache.len(), self.pending.len());
             }
             Ext::Exec(line) if debug() && line.starts_with("debug-mem") => {
@@ -1608,6 +1619,9 @@ impl App {
             self.cache.clear();
         }
         self.pending.clear();
+        if let Some(p) = self.pin.as_mut() {
+            p.pending.clear();
+        }
         if let Some(f) = self.float.as_mut() {
             // queued float requests died with the generation; ask for them again
             f.pending.clear();
@@ -1918,7 +1932,8 @@ impl App {
             Command::HWrite(p, force) => self.write_highlights_pdf(p, force),
             Command::Snip => self.arm_snip(false),
             Command::SnipText => self.arm_snip(true),
-            Command::Pin | Command::PinFocus => {}
+            Command::Pin => self.toggle_pin(),
+            Command::PinFocus => self.pin_focus_toggle(),
             Command::ReloadConfig => {
                 self.load_config();
                 if self.message.is_none() {
@@ -2323,7 +2338,9 @@ impl App {
                 }
             },
             Overlay::None => {
-                if let (Some(d @ '1'..='4'), true, true) = (ch, self.sel.is_some(), self.mode == Mode::Normal && self.keys.display().is_empty()) {
+                if self.pin.as_ref().is_some_and(|p| p.focus) && self.mode == Mode::Normal && !self.in_float {
+                    self.pin_key(&token, el);
+                } else if let (Some(d @ '1'..='4'), true, true) = (ch, self.sel.is_some(), self.mode == Mode::Normal && self.keys.display().is_empty()) {
                     // colour of the active selection
                     self.exec(Command::HlColor(d as u8 - b'0'), None, el);
                 } else if let Some((cmd, count)) = self.keys.feed(&self.keymap, self.mode, &token) {
@@ -2579,7 +2596,7 @@ impl App {
     fn paint(&mut self) {
         let Some(window) = self.window.clone() else { return };
         let size = window.inner_size();
-        self.vp = (size.width, size.height);
+        self.vp = (self.view_w(size.width), size.height);
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         self.clamp_scroll();
 
@@ -2602,6 +2619,7 @@ impl App {
             self.wanted_main = wanted.clone();
         }
         self.sync_wanted();
+        self.pin_prepare();
         let gen = self.render.gen.load(Ordering::Relaxed);
         let recolor = self.applied.recolor.with_enabled(self.cfg.recolor.enabled);
         for k in wanted.iter().filter(|_| !self.zoom_hold) {
@@ -2656,7 +2674,9 @@ impl App {
         let profile = self.profile_active.clone().filter(|n| n != "normal");
         let total = self.layout.len();
         let zoom_pct = (self.zoom * 100.0).round() as u32;
+        let pin_focus = self.pin.as_ref().is_some_and(|p| p.focus) && !self.in_float;
         let mode_name = match (&self.overlay, self.mode) {
+            _ if pin_focus => "PIN",
             (Overlay::Help(_), _) => "HELP",
             (Overlay::Hints(_), _) => "HINTS",
             (Overlay::List(_), _) => "PREVIEWS",
@@ -2699,6 +2719,12 @@ impl App {
 
         for &(x, y, ww, hh, c) in &marks {
             cv.fill_rect(x, y, ww, hh, c);
+        }
+
+        if let (Some(p), false, Some(win_w)) = (&self.pin, self.in_float, Some(size.width as i32)) {
+            let rect = (self.vp.0 as i32, 0, win_w - self.vp.0 as i32, doc_h as i32);
+            let focus = if p.focus { pm(crate::ui::ACCENT, 0xff) } else { pm(crate::ui::DIM, 0x80) };
+            crate::ui::pin::draw(&mut cv, &mut self.cache, p, &self.layout, rect, bg, under, focus);
         }
 
         let full_w = cv.w;
@@ -2978,12 +3004,18 @@ impl ApplicationHandler<()> for App {
                     if let Some(f) = self.float.as_mut() {
                         f.pending.remove(&key);
                     }
+                    if let Some(p) = self.pin.as_mut() {
+                        p.pending.remove(&key);
+                    }
                     self.cache.insert(key, tile);
                     tiles = true;
                 }
                 Response::Tile { .. } => {}
                 Response::Skipped { key } => {
                     self.pending.remove(&key);
+                    if let Some(p) = self.pin.as_mut() {
+                        p.pending.remove(&key);
+                    }
                 }
                 Response::Hits { id, page, rects } => {
                     let hit = match self.search.as_mut() {
@@ -3052,6 +3084,7 @@ impl ApplicationHandler<()> for App {
                 });
                 let mut scales = vec![self.scale_key()];
                 scales.extend(self.float_scale_key());
+                scales.extend(self.pin_scale_key());
                 self.cache.retain_scales(&scales);
             }
         }
@@ -3069,7 +3102,7 @@ impl ApplicationHandler<()> for App {
             WindowEvent::Focused(false) => self.save_state(),
             WindowEvent::RedrawRequested => self.paint(),
             WindowEvent::Resized(sz) => {
-                self.vp = (sz.width, sz.height);
+                self.vp = (self.view_w(sz.width), sz.height);
                 if self.present.is_some() {
                     self.present_fit();
                 } else if let Some((z, x, y)) = self.unpresent.filter(|_| self.window.as_ref().is_some_and(|w| w.fullscreen().is_none())) {
@@ -3125,11 +3158,15 @@ impl ApplicationHandler<()> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = self.wheel_notches(delta, self.dpi);
                 let over_popup = self.popup.as_ref().is_some_and(|p| p.contains(self.cursor.0, self.cursor.1));
+                let in_pane = self.in_pane();
                 match &mut self.overlay {
                     _ if over_popup => {
                         if let Some(p) = self.popup.as_mut() {
                             p.scroll_by((-dy * self.cfg.wheel_step * self.dpi) as i32);
                         }
+                    }
+                    Overlay::None if self.pin.is_some() && (self.pin.as_ref().is_some_and(|p| p.focus) || in_pane) => {
+                        self.pin_wheel(dx, dy, self.mods.control_key());
                     }
                     Overlay::List(l) => {
                         if let Some(pv) = &self.pv {

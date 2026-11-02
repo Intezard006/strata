@@ -4,6 +4,7 @@ pub mod help;
 pub mod index;
 pub mod input;
 pub mod pick;
+pub mod pin;
 pub mod plist;
 pub mod popup;
 pub mod select;

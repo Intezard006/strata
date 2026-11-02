@@ -51,8 +51,8 @@ pub struct TileCache {
     bytes: usize,
     cap: usize,
     tick: u64,
-    /// Tiles currently on screen, per view (main, float): never evicted, even above the cap.
-    pinned: [HashSet<TileKey>; 2],
+    /// Tiles currently on screen, per view (main, float, pin pane): never evicted, even above the cap.
+    pinned: [HashSet<TileKey>; 3],
     /// Tiles evicted or refused since the pinned set last changed: not requested again until it does,
     /// so a cap smaller than the wanted set cannot cause a render/evict loop.
     denied: HashSet<TileKey>,
@@ -85,7 +85,7 @@ impl TileCache {
         })
     }
 
-    /// Declare the tiles `view` (0 main, 1 float) shows. A change forgives earlier denials.
+    /// Declare the tiles `view` (0 main, 1 float, 2 pin pane) shows. A change forgives earlier denials.
     pub fn set_pinned(&mut self, view: usize, keys: &[TileKey]) {
         if self.pinned[view].len() != keys.len() || !keys.iter().all(|k| self.pinned[view].contains(k)) {
             self.pinned[view] = keys.iter().copied().collect();
@@ -94,7 +94,7 @@ impl TileCache {
     }
 
     fn is_pinned(&self, k: &TileKey) -> bool {
-        self.pinned[0].contains(k) || self.pinned[1].contains(k)
+        self.pinned.iter().any(|p| p.contains(k))
     }
 
     /// Whether paint should (re)request `k`: not cached, and not already evicted/refused for this view.

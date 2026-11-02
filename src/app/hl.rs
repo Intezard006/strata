@@ -31,6 +31,15 @@ impl App {
             self.drag = Drag::Snip { from: (mx, my), to: (mx, my) };
             return;
         }
+        if self.pin.is_some() {
+            let in_pane = self.in_pane();
+            if let Some(p) = self.pin.as_mut() {
+                p.focus = in_pane;
+            }
+            if in_pane {
+                return self.redraw();
+            }
+        }
         let had = self.sel.is_some();
         self.clear_selection();
         self.drag = Drag::Select { press: (mx, my), moved: false };
