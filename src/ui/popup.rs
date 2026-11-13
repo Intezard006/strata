@@ -1,6 +1,6 @@
 //! The preview popup: a clipped render of a target inside a bordered panel.
 
-use super::{pm, Canvas, ACCENT, DIM, FG};
+use super::{accent, dim, fg, outline, pm, theme, Canvas};
 use crate::render::Tile;
 use crate::text::TextRenderer;
 
@@ -152,10 +152,8 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup, bottom_reserve
     // opaque base first, so nothing of the page shows through, then the (nearly opaque) panel colour
     cv.fill_rect(x, y, w, h, pm([bg[0] / 2, bg[1] / 2, bg[2] / 2], 0xff));
     cv.fill_rect(x, y, w, h, pm([bg[0], bg[1], bg[2]], bg[3]));
-    for (bx, by, bw, bh) in [(x, y, w, 1), (x, y + h - 1, w, 1), (x, y, 1, h), (x + w - 1, y, 1, h)] {
-        cv.fill_rect(bx, by, bw, bh, pm(ACCENT, 0xff));
-    }
-    t.draw(cv, x + PAD, y + 3, &p.title, ACCENT, w - 2 * PAD);
+    outline(cv, x, y, w, h, pm(theme().line, 0xff));
+    t.draw(cv, x + PAD, y + 3, &p.title, accent(), w - 2 * PAD);
     let body_y = y + t.line_h + 6;
     let body_h = h - (t.line_h + 6) - 1;
     if let Some(ls) = note_lines {
@@ -164,7 +162,7 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup, bottom_reserve
         for (i, l) in ls.iter().enumerate() {
             let ly = body_y + PAD / 2 + i as i32 * t.line_h - p.scroll;
             if ly >= body_y && ly + t.line_h <= body_y + body_h {
-                t.draw(cv, x + PAD, ly, l, FG, w - 2 * PAD);
+                t.draw(cv, x + PAD, ly, l, fg(), w - 2 * PAD);
             }
         }
         return;
@@ -179,20 +177,20 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Popup, bottom_reserve
             if max_scroll > 0 {
                 let frac = p.scroll as f32 / max_scroll as f32;
                 let bar_h = (body_h as f32 * body_h as f32 / (tile.h as f32 + PAD as f32)).max(14.0) as i32;
-                cv.fill_rect(x + w - 6, body_y, 3, body_h, pm(DIM, 0x40));
-                cv.fill_rect(x + w - 6, body_y + ((body_h - bar_h) as f32 * frac) as i32, 3, bar_h, pm(ACCENT, 0xe0));
+                cv.fill_rect(x + w - 6, body_y, 3, body_h, pm(dim(), 0x40));
+                cv.fill_rect(x + w - 6, body_y + ((body_h - bar_h) as f32 * frac) as i32, 3, bar_h, pm(theme().line, 0xe0));
                 if p.scroll < max_scroll {
                     let sh = t.line_h + 2;
                     cv.fill_rect(x + 1, y + h - sh - 1, w - 2, sh, pm([bg[0] / 2, bg[1] / 2, bg[2] / 2], 0xff));
-                    t.draw(cv, x + PAD, y + h - sh, "v more  (j/k or wheel to scroll)", ACCENT, w - 2 * PAD);
+                    t.draw(cv, x + PAD, y + h - sh, "v more  (j/k or wheel to scroll)", accent(), w - 2 * PAD);
                 }
             }
         }
         Some(_) => {
-            t.draw(cv, x + PAD, body_y + 2, "(nothing to show)", DIM, w - 2 * PAD);
+            t.draw(cv, x + PAD, body_y + 2, "(nothing to show)", dim(), w - 2 * PAD);
         }
         None => {
-            t.draw(cv, x + PAD, body_y + 2, "rendering...", FG, w - 2 * PAD);
+            t.draw(cv, x + PAD, body_y + 2, "rendering...", fg(), w - 2 * PAD);
         }
     }
 }

@@ -11,6 +11,7 @@ mod keys;
 mod layout;
 mod links;
 mod pages;
+mod palette;
 mod pinch;
 mod previews;
 mod pstore;

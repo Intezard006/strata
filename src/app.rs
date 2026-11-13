@@ -47,7 +47,7 @@ use crate::ui::index::{self, Index, Item};
 use crate::worker::{Job, Msg};
 use crate::ui::input::{History, InputBar};
 use crate::ui::statusbar::{self, Status};
-use crate::ui::{over, pm, Canvas, FG};
+use crate::ui::{fg, over, pm, Canvas};
 
 static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static FIRST_TILE: std::sync::Once = std::sync::Once::new();
@@ -267,6 +267,8 @@ pub struct App {
     wanted_main: Vec<TileKey>,
     wanted_float: Vec<TileKey>,
     profiles: Vec<config::Profile>,
+    /// NERV palette, read at start-up and on config reload (only while `nerv-chrome` is on).
+    palette: Option<crate::palette::Palette>,
     base: Config,
     profile_active: Option<String>,
     drag: Drag,
@@ -398,6 +400,7 @@ impl App {
             wanted_main: Vec::new(),
             wanted_float: Vec::new(),
             profiles: Vec::new(),
+            palette: None,
             base: Config::default(),
             profile_active: None,
             drag: Drag::None,
@@ -424,6 +427,7 @@ impl App {
 
     fn load_config(&mut self) {
         self.cfg = Config::default();
+        self.palette = None;
         self.profiles.clear();
         self.keymap = Keymap::with_defaults();
         let path = config::config_path();
@@ -451,8 +455,11 @@ impl App {
                 }
             }
         }
+        if self.cfg.nerv_chrome {
+            self.palette = crate::palette::load();
+        }
         if self.profiles.is_empty() {
-            self.profiles = config::builtin_profiles();
+            self.profiles = config::builtin_profiles(self.palette.as_ref());
         }
         self.base = self.cfg.clone();
         let saved = self.profile_active.clone().or_else(|| self.db.as_ref().and_then(|d| d.kv("profile")));
@@ -487,6 +494,7 @@ impl App {
 
     /// Push changed options into the running state.
     fn apply_config(&mut self) {
+        crate::ui::set_theme(crate::ui::Theme::resolve(self.cfg.nerv_chrome, self.palette.as_ref()));
         self.bg = premultiply(self.cfg.default_bg);
         self.cache.set_cap(self.cfg.cache_mb << 20);
         let rc = self.cfg.effective_recolor();
@@ -2694,7 +2702,7 @@ impl App {
         let job_text = self.job_status.clone();
         let index_auto = self.index_auto;
         let search_pos = self.search.as_ref().map(|s| (s.index().map_or(0, |i| i + 1), s.hits.len(), s.done));
-        let panel_bg = self.cfg.preview_bg;
+        let panel_bg = if self.cfg.preview_bg_set { self.cfg.preview_bg } else { crate::ui::theme().popup };
         let bar_visible = self.cfg.statusbar && !self.in_float && !self.float_solo && self.present.is_none();
         let bg = if self.present.is_some() { premultiply(self.cfg.presentation_bg) } else { self.bg };
         let shot = self.shot.take();
@@ -2723,7 +2731,7 @@ impl App {
 
         if let (Some(p), false, Some(win_w)) = (&self.pin, self.in_float, Some(size.width as i32)) {
             let rect = (self.vp.0 as i32, 0, win_w - self.vp.0 as i32, doc_h as i32);
-            let focus = if p.focus { pm(crate::ui::ACCENT, 0xff) } else { pm(crate::ui::DIM, 0x80) };
+            let focus = if p.focus { pm(crate::ui::theme().line, 0xff) } else { pm(crate::ui::dim(), 0x80) };
             crate::ui::pin::draw(&mut cv, &mut self.cache, p, &self.layout, rect, bg, focus);
         }
 
@@ -2734,8 +2742,9 @@ impl App {
             let bar = if bar_visible { statusbar::height(t) } else { 0 };
             for (x, y, label, typed) in &hint_draw {
                 let lw = t.width(label) + 6;
-                cv.fill_rect(*x, *y, lw, t.line_h, pm([0xf9, 0xe2, 0xaf], 0xf0));
-                t.draw(&mut cv, *x + 3, *y, &label[*typed..], [0x11, 0x11, 0x1b], lw);
+                let th = crate::ui::theme();
+                cv.fill_rect(*x, *y, lw, t.line_h, pm(th.hint_bg, 0xf0));
+                t.draw(&mut cv, *x + 3, *y, &label[*typed..], th.hint_fg, lw);
             }
             if let Overlay::Help(hp) = &self.overlay {
                 help_rows = Some(crate::ui::help::draw(&mut cv, t, hp, bar));
@@ -2766,20 +2775,20 @@ impl App {
                 statusbar::draw(&mut cv, t, &st);
             } else if let (Some((m, e)), false) = (&msg, matches!(self.overlay, Overlay::Input(_))) {
                 let y = cv.h - t.line_h - 4;
-                cv.fill_rect(0, y, cv.w, t.line_h + 4, pm([0x11, 0x11, 0x1b], 0xcc));
-                t.draw(&mut cv, 8, y + 2, m, if *e { crate::ui::ERR } else { FG }, full_w - 16);
+                cv.fill_rect(0, y, cv.w, t.line_h + 4, crate::ui::bar_bg());
+                t.draw(&mut cv, 8, y + 2, m, if *e { crate::ui::err() } else { fg() }, full_w - 16);
             }
             if let Overlay::Input(bar_in) = &self.overlay {
                 let y = cv.h - t.line_h - 6;
-                cv.fill_rect(0, y, cv.w, t.line_h + 6, pm([0x1e, 0x1e, 0x2e], 0xff));
+                cv.fill_rect(0, y, cv.w, t.line_h + 6, crate::ui::input_bg());
                 let cw = t.width("M").max(1);
                 let pre = bar_in.prefix.to_string();
-                let mut x = t.draw(&mut cv, cw, y + 3, &pre, crate::ui::ACCENT, full_w);
+                let mut x = t.draw(&mut cv, cw, y + 3, &pre, crate::ui::accent(), full_w);
                 let before: String = bar_in.text[..bar_in.cursor].iter().collect();
                 let after: String = bar_in.text[bar_in.cursor..].iter().collect();
-                x = t.draw(&mut cv, x, y + 3, &before, FG, full_w);
-                cv.fill_rect(x, y + 3, cw, t.line_h, pm(FG, 0xa0));
-                t.draw(&mut cv, x, y + 3, &after, FG, full_w);
+                x = t.draw(&mut cv, x, y + 3, &before, fg(), full_w);
+                cv.fill_rect(x, y + 3, cw, t.line_h, pm(fg(), 0xa0));
+                t.draw(&mut cv, x, y + 3, &after, fg(), full_w);
             }
         }
         if let Some(path) = shot {

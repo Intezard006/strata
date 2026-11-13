@@ -234,8 +234,8 @@ impl App {
                     }
                     if let Some(m) = select::marker_rect(h, pw) {
                         let (x, y, w, hh) = px(ox, oy, m);
-                        out.push((x, y, w, hh, pm(crate::ui::ACCENT, 0xf0)));
-                        out.push((x + w / 4, y + hh / 4, w / 2, hh / 2, pm([0x11, 0x11, 0x1b], 0xff)));
+                        out.push((x, y, w, hh, pm(crate::ui::theme().line, 0xf0)));
+                        out.push((x + w / 4, y + hh / 4, w / 2, hh / 2, pm(crate::ui::theme().bar, 0xff)));
                     }
                 }
             }
@@ -243,11 +243,11 @@ impl App {
         if let Some(sel) = &self.sel {
             if vis.contains(&(sel.page as usize)) {
                 let (ox, oy) = self.page_origin(sel.page as usize);
-                let edge = pm(crate::ui::ACCENT, 0x70);
+                let edge = pm(crate::ui::theme().line, 0x70);
                 for r in &sel.rects {
                     let (x, y, w, h) = px(ox, oy, *r);
                     if sel.hl.is_none() {
-                        out.push((x, y, w, h, pm(crate::ui::ACCENT, 0x55)));
+                        out.push((x, y, w, h, pm(crate::ui::theme().line, 0x55)));
                     }
                     out.push((x, y + h - 1, w, 1, edge));
                 }
@@ -256,8 +256,8 @@ impl App {
         if let Drag::Snip { from, to } = &self.drag {
             let r = select::norm_rect(*from, *to);
             let (x, y, w, h) = (r[0] as i32, r[1] as i32, (r[2] - r[0]) as i32, (r[3] - r[1]) as i32);
-            let e = pm(crate::ui::ACCENT, 0xff);
-            out.push((x, y, w, h, pm(crate::ui::ACCENT, 0x28)));
+            let e = pm(crate::ui::theme().line, 0xff);
+            out.push((x, y, w, h, pm(crate::ui::theme().line, 0x28)));
             out.extend([(x, y, w, 2, e), (x, y + h - 2, w, 2, e), (x, y, 2, h, e), (x + w - 2, y, 2, h, e)]);
         }
         out

@@ -1,6 +1,6 @@
 //! Help overlay generated from the keymap and command registry.
 
-use super::{panel_bg, pm, Canvas, ACCENT, DIM, FG};
+use super::{accent, band, dim, fg, panel_bg, Canvas};
 use crate::config::OPTIONS;
 use crate::keys::{Keymap, Mode, COMMANDS};
 use crate::text::TextRenderer;
@@ -84,7 +84,7 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, h: &Help, bottom_reserved: i3
     let cw = t.width("M").max(1);
     let pad = cw * 2;
     let title = format!("Help  (type to filter, Esc to close)   filter: {}_", h.query);
-    t.draw(cv, pad, 6, &title, ACCENT, cv.w - 2 * pad);
+    t.draw(cv, pad, 6, &title, accent(), cv.w - 2 * pad);
     let top = lh + 14;
     let rows = ((cv.h - bottom_reserved - top - 6) / lh).max(1) as usize;
     let col = (cw * 28).min(cv.w / 2);
@@ -92,12 +92,12 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, h: &Help, bottom_reserved: i3
         let y = top + i as i32 * lh;
         match l {
             Line::Header(s) => {
-                cv.fill_rect(0, y, cv.w, lh, pm([0x45, 0x47, 0x5a], 0x90));
-                t.draw(cv, pad, y, s, ACCENT, cv.w - 2 * pad);
+                band(cv, y, lh);
+                t.draw(cv, pad, y, s, accent(), cv.w - 2 * pad);
             }
             Line::Item { left, right } => {
-                t.draw(cv, pad, y, left, FG, col - pad);
-                t.draw(cv, col, y, right, DIM, cv.w - col - pad);
+                t.draw(cv, pad, y, left, fg(), col - pad);
+                t.draw(cv, col, y, right, dim(), cv.w - col - pad);
             }
         }
     }

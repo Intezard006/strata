@@ -1,6 +1,6 @@
 //! `:previews` — fuzzy-filterable list of all targets grouped by kind.
 
-use super::{panel_bg, pm, sel_bg, Canvas, ACCENT, DIM, FG};
+use super::{accent, band, dim, fg, panel_bg, sel_band, Canvas};
 use crate::previews::{Kind, Target};
 use crate::text::TextRenderer;
 
@@ -118,7 +118,7 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, l: &mut PList, targets: &[Tar
     let cw = t.width("M").max(1);
     let pad = cw * 2;
     let title = format!("Previews  ({} shown; type to filter, Enter jump, Space/Tab preview, Esc close)   filter: {}_", l.items(targets).len(), l.query);
-    t.draw(cv, pad, 6, &title, ACCENT, cv.w - 2 * pad);
+    t.draw(cv, pad, 6, &title, accent(), cv.w - 2 * pad);
     let top = lh + 14;
     let nrows = ((cv.h - bottom_reserved - top - 6) / lh).max(1) as usize;
     let (rows, sel_row) = l.rows(targets);
@@ -130,27 +130,27 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, l: &mut PList, targets: &[Tar
         }
     }
     if rows.is_empty() {
-        t.draw(cv, pad, top, "No previewable items (analysis not finished, or previews are off)", DIM, cv.w - 2 * pad);
+        t.draw(cv, pad, top, "No previewable items (analysis not finished, or previews are off)", dim(), cv.w - 2 * pad);
     }
     for (i, r) in rows.iter().skip(l.scroll).take(nrows).enumerate() {
         let y = top + i as i32 * lh;
         match r {
             Row::Header(s) => {
-                cv.fill_rect(0, y, cv.w, lh, pm([0x45, 0x47, 0x5a], 0x90));
-                t.draw(cv, pad, y, s, ACCENT, cv.w - 2 * pad);
+                band(cv, y, lh);
+                t.draw(cv, pad, y, s, accent(), cv.w - 2 * pad);
             }
             Row::Item(id) => {
                 let tg = &targets[*id as usize];
                 if sel_row == Some(l.scroll + i) {
-                    cv.fill_rect(0, y, cv.w, lh, sel_bg());
+                    sel_band(cv, y, lh);
                 }
                 let lab = format!("{} {}", tg.kind.name(), tg.label);
                 let col2 = pad + (cw * 22).min(cv.w / 3);
                 let page = format!("p.{}", crate::pages::label(map, tg.page));
                 let pw = t.width(&page);
-                t.draw(cv, pad, y, &lab, FG, col2 - pad);
-                t.draw(cv, col2, y, &tg.text, DIM, cv.w - col2 - pw - 3 * pad);
-                t.draw(cv, cv.w - pw - pad, y, &page, DIM, pw + 4);
+                t.draw(cv, pad, y, &lab, fg(), col2 - pad);
+                t.draw(cv, col2, y, &tg.text, dim(), cv.w - col2 - pw - 3 * pad);
+                t.draw(cv, cv.w - pw - pad, y, &page, dim(), pw + 4);
             }
         }
     }

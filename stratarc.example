@@ -20,6 +20,7 @@ set touchpad-scroll-factor 1.0    # multiplier for touchpad scrolling
 set wheel-zoom-step      0        # Ctrl+wheel zoom % per notch (0 = zoom-step)
 set page-gap             8
 set statusbar            true
+# set nerv-chrome        false   # ignore ~/.config/nerv/palette.toml (read at start and on reload)
 set font                 "monospace"
 set font-size            13
 set incremental-search   true
@@ -37,7 +38,7 @@ set recolor-contrast-vector false # also apply it to vector text and drawings
 set recolor-invert-dark-images false  # recolor dark page-sized images (covers) with an inverted mapping
 set goto-printed         true     # :goto 120 means printed page 120 when the book has page numbers
 
-# Look profiles: Ctrl-t cycles, :profile NAME applies. Without any `profile` line, `normal` and `textbook` exist.
+# Look profiles: Ctrl-t cycles, :profile NAME applies. Without any `profile` line, `normal`, `textbook` and `nerv` (amber on black) exist; once you define profiles, copy the `nerv` lines from README to keep it.
 # profile textbook recolor-lightcolor rgba(0,0,0,0)
 # profile textbook recolor-darkcolor  rgba(255,255,255,1)
 # profile textbook default-bg         rgba(0,0,0,0)

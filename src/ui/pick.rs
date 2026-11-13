@@ -1,7 +1,7 @@
 //! Fuzzy picker panel: `:blist`, `:recent` and the command palette. Items are built when the panel
 //! opens and dropped when it closes.
 
-use super::{panel_bg, sel_bg, Canvas, ACCENT, DIM, FG};
+use super::{accent, dim, fg, panel_bg, sel_band, Canvas};
 use crate::text::TextRenderer;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -244,7 +244,7 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Pick, bottom_reserved
     let hint = if p.kind == PickKind::Palette { "  > cmds  # index  @ bookmarks  = previews  % recent" } else { "" };
     let del = if p.kind == PickKind::Highlights { ", Ctrl-X delete" } else { "" };
     let title = format!("{}  ({} shown; Enter select{}, Esc close){}   filter: {}_", p.title, p.shown.len(), del, hint, p.query);
-    t.draw(cv, pad, 6, &title, ACCENT, cv.w - 2 * pad);
+    t.draw(cv, pad, 6, &title, accent(), cv.w - 2 * pad);
     let top = lh + 14;
     let nrows = ((cv.h - bottom_reserved - top - 6) / lh).max(1) as usize;
     if p.sel < p.scroll {
@@ -253,24 +253,24 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, p: &mut Pick, bottom_reserved
         p.scroll = p.sel + 1 - nrows;
     }
     if p.shown.is_empty() {
-        t.draw(cv, pad, top, "Nothing here", DIM, cv.w - 2 * pad);
+        t.draw(cv, pad, top, "Nothing here", dim(), cv.w - 2 * pad);
     }
     let tagw = if p.kind == PickKind::Palette { cw * 6 } else { 0 };
     for (i, &id) in p.shown.iter().skip(p.scroll).take(nrows).enumerate() {
         let y = top + i as i32 * lh;
         let it = &p.items[id];
         if p.scroll + i == p.sel {
-            cv.fill_rect(0, y, cv.w, lh, sel_bg());
+            sel_band(cv, y, lh);
         }
         if tagw > 0 {
-            t.draw(cv, pad, y, it.group.tag(), DIM, tagw);
+            t.draw(cv, pad, y, it.group.tag(), dim(), tagw);
         }
         let x0 = pad + tagw;
         let col2 = x0 + (cw * 24).min(cv.w / 3);
         let rw = t.width(&it.right);
-        t.draw(cv, x0, y, &it.label, FG, col2 - x0 - cw);
-        t.draw(cv, col2, y, &it.detail, DIM, (cv.w - col2 - rw - 3 * pad).max(0));
-        t.draw(cv, cv.w - rw - pad, y, &it.right, DIM, rw + 4);
+        t.draw(cv, x0, y, &it.label, fg(), col2 - x0 - cw);
+        t.draw(cv, col2, y, &it.detail, dim(), (cv.w - col2 - rw - 3 * pad).max(0));
+        t.draw(cv, cv.w - rw - pad, y, &it.right, dim(), rw + 4);
     }
 }
 

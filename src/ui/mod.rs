@@ -82,17 +82,149 @@ impl Canvas<'_> {
     }
 }
 
-pub const FG: [u8; 3] = [0xcd, 0xd6, 0xf4];
-pub const DIM: [u8; 3] = [0x93, 0x99, 0xb2];
-pub const ERR: [u8; 3] = [0xf3, 0x8b, 0xa8];
-pub const ACCENT: [u8; 3] = [0x89, 0xb4, 0xfa];
-
-pub fn panel_bg() -> u32 {
-    pm([0x1d, 0x1d, 0x2d], 0xff)
+/// Chrome colours: the built-in look, or the NERV palette when `nerv-chrome` is on and the file exists.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Theme {
+    pub fg: [u8; 3],
+    pub dim: [u8; 3],
+    pub err: [u8; 3],
+    /// Titles and prompts (text).
+    pub accent: [u8; 3],
+    /// Structural lines: popup border, scrollbar thumb, pin focus, selection outline.
+    pub line: [u8; 3],
+    pub panel: [u8; 3],
+    pub bar: [u8; 3],
+    pub input: [u8; 3],
+    pub popup: [u8; 4],
+    pub hint_bg: [u8; 3],
+    pub hint_fg: [u8; 3],
+    /// Selection rows are outlined instead of filled.
+    pub nerv: bool,
 }
 
-pub fn sel_bg() -> u32 {
-    pm([0x45, 0x47, 0x5a], 0xe0)
+impl Default for Theme {
+    fn default() -> Self {
+        Theme {
+            fg: [0xcd, 0xd6, 0xf4],
+            dim: [0x93, 0x99, 0xb2],
+            err: [0xf3, 0x8b, 0xa8],
+            accent: [0x89, 0xb4, 0xfa],
+            line: [0x89, 0xb4, 0xfa],
+            panel: [0x1d, 0x1d, 0x2d],
+            bar: [0x11, 0x11, 0x1b],
+            input: [0x1e, 0x1e, 0x2e],
+            popup: [0x1e, 0x1e, 0x2e, 0xf2],
+            hint_bg: [0xf9, 0xe2, 0xaf],
+            hint_fg: [0x11, 0x11, 0x1b],
+            nerv: false,
+        }
+    }
+}
+
+impl Theme {
+    /// Default look with the palette's keys laid over it; missing keys keep the NERV defaults.
+    pub fn nerv(p: &crate::palette::Palette) -> Theme {
+        let field = p.field.unwrap_or([0, 0, 0]);
+        let signal = p.signal.unwrap_or(crate::palette::SIGNAL);
+        let grid = p.grid.unwrap_or([0x4c, 0xe8, 0xa8]);
+        Theme {
+            fg: signal,
+            dim: p.dim.unwrap_or([0xa8, 0x52, 0x1a]),
+            err: p.alarm.unwrap_or([0xff, 0x20, 0x30]),
+            accent: signal,
+            line: grid,
+            panel: field,
+            bar: field,
+            input: field,
+            popup: [field[0], field[1], field[2], 0xf2],
+            hint_bg: signal,
+            hint_fg: field,
+            nerv: true,
+        }
+    }
+
+    /// `nerv-chrome` on and a palette file present gives the NERV look; otherwise exactly the built-in one.
+    pub fn resolve(nerv_chrome: bool, pal: Option<&crate::palette::Palette>) -> Theme {
+        match pal {
+            Some(p) if nerv_chrome => Theme::nerv(p),
+            _ => Theme::default(),
+        }
+    }
+}
+
+static THEME: std::sync::RwLock<Theme> = std::sync::RwLock::new(Theme {
+    fg: [0xcd, 0xd6, 0xf4],
+    dim: [0x93, 0x99, 0xb2],
+    err: [0xf3, 0x8b, 0xa8],
+    accent: [0x89, 0xb4, 0xfa],
+    line: [0x89, 0xb4, 0xfa],
+    panel: [0x1d, 0x1d, 0x2d],
+    bar: [0x11, 0x11, 0x1b],
+    input: [0x1e, 0x1e, 0x2e],
+    popup: [0x1e, 0x1e, 0x2e, 0xf2],
+    hint_bg: [0xf9, 0xe2, 0xaf],
+    hint_fg: [0x11, 0x11, 0x1b],
+    nerv: false,
+});
+
+pub fn theme() -> Theme {
+    *THEME.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn set_theme(t: Theme) {
+    *THEME.write().unwrap_or_else(|e| e.into_inner()) = t;
+}
+
+pub fn fg() -> [u8; 3] {
+    theme().fg
+}
+pub fn dim() -> [u8; 3] {
+    theme().dim
+}
+pub fn err() -> [u8; 3] {
+    theme().err
+}
+pub fn accent() -> [u8; 3] {
+    theme().accent
+}
+
+pub fn panel_bg() -> u32 {
+    pm(theme().panel, 0xff)
+}
+
+/// Statusbar and message strip background (translucent in both looks).
+pub fn bar_bg() -> u32 {
+    pm(theme().bar, 0xcc)
+}
+
+pub fn input_bg() -> u32 {
+    pm(theme().input, 0xff)
+}
+
+/// Selected list row: a filled band, or a one-pixel outline in the NERV look.
+pub fn sel_band(cv: &mut Canvas, y: i32, lh: i32) {
+    let t = theme();
+    if t.nerv {
+        outline(cv, 0, y, cv.w, lh, pm(t.line, 0xff));
+    } else {
+        cv.fill_rect(0, y, cv.w, lh, pm([0x45, 0x47, 0x5a], 0xe0));
+    }
+}
+
+/// Section header row: a filled band, or a one-pixel rule under it in the NERV look.
+pub fn band(cv: &mut Canvas, y: i32, lh: i32) {
+    let t = theme();
+    if t.nerv {
+        cv.fill_rect(0, y + lh - 1, cv.w, 1, pm(t.line, 0xff));
+    } else {
+        cv.fill_rect(0, y, cv.w, lh, pm([0x45, 0x47, 0x5a], 0x90));
+    }
+}
+
+pub fn outline(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, c: u32) {
+    for (bx, by, bw, bh) in [(x, y, w, 1), (x, y + h - 1, w, 1), (x, y, 1, h), (x + w - 1, y, 1, h)] {
+        cv.fill_rect(bx, by, bw, bh, c);
+    }
 }
 
 #[cfg(test)]

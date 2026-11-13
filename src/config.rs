@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::palette::Palette;
 use crate::recolor::{ImageMode, Recolor};
 
 #[derive(Clone)]
@@ -31,6 +32,10 @@ pub struct Config {
     pub preview_hover_ms: u64,
     pub preview_max_scale: f32,
     pub preview_bg: [u8; 4],
+    /// `preview-bg` was set explicitly; the NERV palette then leaves the popup colour alone.
+    pub preview_bg_set: bool,
+    /// Take chrome colours from the NERV palette file when it exists.
+    pub nerv_chrome: bool,
     pub restore_position: bool,
     pub goto_printed: bool,
     pub float_width: u32,
@@ -53,12 +58,16 @@ pub struct Profile {
     pub opts: Vec<(String, String)>,
 }
 
-/// The profiles used when the config defines none: the old zathura `normal` and `textbook` looks.
-pub fn builtin_profiles() -> Vec<Profile> {
+/// The profiles used when the config defines none: the old zathura `normal` and `textbook` looks, and
+/// `nerv` (amber on black; the ink is the palette's signal colour when `pal` is given).
+pub fn builtin_profiles(pal: Option<&Palette>) -> Vec<Profile> {
+    let s = pal.and_then(|p| p.signal).unwrap_or(crate::palette::SIGNAL);
+    let signal = format!("#{:02x}{:02x}{:02x}", s[0], s[1], s[2]);
     let p = |name: &str, o: &[(&str, &str)]| Profile { name: name.into(), opts: o.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect() };
     vec![
         p("normal", &[("recolor-lightcolor", "#1e1e2e"), ("recolor-darkcolor", "#ffffff"), ("default-bg", "#1e1e2e99"), ("recolor-keephue", "true")]),
         p("textbook", &[("recolor-lightcolor", "rgba(0,0,0,0)"), ("recolor-darkcolor", "rgba(255,255,255,1)"), ("default-bg", "rgba(0,0,0,0)"), ("recolor-keephue", "false")]),
+        p("nerv", &[("recolor-lightcolor", "#000000"), ("recolor-darkcolor", &signal), ("default-bg", "#000000"), ("recolor-keephue", "false")]),
     ]
 }
 
@@ -119,6 +128,7 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("previews", "Hover/keyboard previews of equations, theorems, figures (true/false)"),
     ("preview-hover-ms", "Hover time before a preview popup opens, in ms"),
     ("preview-bg", "Preview popup background (#rrggbbaa)"),
+    ("nerv-chrome", "Take UI colours from ~/.config/nerv/palette.toml when it exists (true/false; read at start and on reload)"),
     ("preview-max-scale", "Maximum render scale of the popup (1 = 100%)"),
     ("restore-position", "Reopen documents at the last position, zoom and recolor state (true/false)"),
     ("goto-printed", "`:goto N` and `NG` use printed page numbers when the book has them (true/false)"),
@@ -159,6 +169,8 @@ impl Default for Config {
             preview_hover_ms: 300,
             preview_max_scale: 3.0,
             preview_bg: [0x1e, 0x1e, 0x2e, 0xf2],
+            preview_bg_set: false,
+            nerv_chrome: true,
             restore_position: true,
             goto_printed: true,
             float_width: 520,
@@ -272,7 +284,11 @@ impl Config {
             "previews" => self.previews = parse_bool(v)?,
             "preview-hover-ms" => self.preview_hover_ms = parse_num(v, 0.0, 5000.0)? as u64,
             "preview-max-scale" => self.preview_max_scale = parse_num(v, 0.5, 8.0)?,
-            "preview-bg" => self.preview_bg = parse_color(v)?,
+            "preview-bg" => {
+                self.preview_bg = parse_color(v)?;
+                self.preview_bg_set = true;
+            }
+            "nerv-chrome" => self.nerv_chrome = parse_bool(v)?,
             "restore-position" => self.restore_position = parse_bool(v)?,
             "goto-printed" => self.goto_printed = parse_bool(v)?,
             "float-width" => self.float_width = parse_num(v, 200.0, 4000.0)? as u32,
@@ -335,6 +351,7 @@ impl Config {
             "preview-hover-ms" => self.preview_hover_ms.to_string(),
             "preview-max-scale" => self.preview_max_scale.to_string(),
             "preview-bg" => fmt_color(self.preview_bg),
+            "nerv-chrome" => self.nerv_chrome.to_string(),
             "restore-position" => self.restore_position.to_string(),
             "goto-printed" => self.goto_printed.to_string(),
             "float-width" => self.float_width.to_string(),
@@ -561,7 +578,8 @@ mod tests {
     #[test]
     fn builtin_profiles_apply() {
         let base = Config::default();
-        let profs = builtin_profiles();
+        let profs = builtin_profiles(None);
+        assert_eq!(profs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["normal", "textbook", "nerv"]);
         let mut c = base.clone();
         assert_eq!(apply_profile(&profs, "textbook", &base, &mut c), Some(vec![]));
         assert_eq!(c.default_bg, [0, 0, 0, 0]);
@@ -570,5 +588,27 @@ mod tests {
         assert_eq!(apply_profile(&profs, "normal", &base, &mut c), Some(vec![]));
         assert!(c.recolor.keephue);
         assert_eq!(c.default_bg, [0x1e, 0x1e, 0x2e, 0x99]);
+        assert_eq!(apply_profile(&profs, "nerv", &base, &mut c), Some(vec![]));
+        assert_eq!((c.default_bg, c.recolor.light, c.recolor.dark, c.recolor.keephue), ([0, 0, 0, 255], [0, 0, 0, 255], [0xff, 0x83, 0x24], false));
+        let pal = Palette { signal: Some([1, 2, 3]), ..Palette::default() };
+        let profs = builtin_profiles(Some(&pal));
+        assert_eq!(apply_profile(&profs, "nerv", &base, &mut c), Some(vec![]));
+        assert_eq!(c.recolor.dark, [1, 2, 3]);
+    }
+
+    #[test]
+    fn explicit_preview_bg_beats_palette() {
+        use crate::ui::Theme;
+        let pal = Palette { field: Some([0, 0, 0]), ..Palette::default() };
+        let mut c = Config::default();
+        assert!(!c.preview_bg_set);
+        assert_eq!(Theme::resolve(c.nerv_chrome, Some(&pal)).popup, [0, 0, 0, 0xf2]);
+        c.set("preview-bg", "#102030ff").unwrap();
+        assert!(c.preview_bg_set);
+        // the app uses cfg.preview_bg whenever it was set explicitly
+        assert_eq!(c.preview_bg, [0x10, 0x20, 0x30, 0xff]);
+        c.set("nerv-chrome", "false").unwrap();
+        assert_eq!(Theme::resolve(c.nerv_chrome, Some(&pal)), Theme::default());
+        assert_eq!(Theme::resolve(true, None), Theme::default());
     }
 }

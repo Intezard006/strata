@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use super::{panel_bg, sel_bg, Canvas, ACCENT, DIM, FG};
+use super::{accent, dim, fg, panel_bg, sel_band, Canvas};
 use crate::text::TextRenderer;
 
 #[derive(Clone, Debug)]
@@ -112,11 +112,11 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, auto: Option<
     let (lh, cw) = (t.line_h, t.width("M").max(1));
     let pad = cw * 2;
     let title = format!("Index{}  (j/k move, l/h expand/collapse, Enter jump, Tab close)", auto.map_or(String::new(), |l| format!(" ({l})")));
-    t.draw(cv, pad, 6, &title, ACCENT, cv.w - 2 * pad);
+    t.draw(cv, pad, 6, &title, accent(), cv.w - 2 * pad);
     let top = lh + 14;
     let rows = ((cv.h - bottom_reserved - top - 6) / lh).max(1) as usize;
     if ix.items.is_empty() {
-        t.draw(cv, pad, top, "No index (:reindex builds one)", DIM, cv.w - 2 * pad);
+        t.draw(cv, pad, top, "No index (:reindex builds one)", dim(), cv.w - 2 * pad);
         return rows;
     }
     ix.keep_visible(rows);
@@ -125,15 +125,15 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, ix: &mut Index, auto: Option<
         let it = &ix.items[i];
         let y = top + r as i32 * lh;
         if ix.scroll + r == ix.sel {
-            cv.fill_rect(0, y, cv.w, lh, sel_bg());
+            sel_band(cv, y, lh);
         }
         let marker = if !it.has_children { "  " } else if ix.expanded.contains(&i) { "v " } else { "> " };
         let x = pad + it.depth as i32 * 2 * cw;
-        let x = t.draw(cv, x, y, marker, DIM, cv.w);
+        let x = t.draw(cv, x, y, marker, dim(), cv.w);
         let page = it.page.map(|p| crate::pages::label(map, p)).unwrap_or_default();
         let pw = t.width(&page) + pad;
-        t.draw(cv, x, y, &it.title, FG, (cv.w - x - pw - pad).max(0));
-        t.draw(cv, cv.w - pw, y, &page, DIM, pw);
+        t.draw(cv, x, y, &it.title, fg(), (cv.w - x - pw - pad).max(0));
+        t.draw(cv, cv.w - pw, y, &page, dim(), pw);
     }
     rows
 }
