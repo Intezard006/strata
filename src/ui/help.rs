@@ -1,6 +1,6 @@
 //! Help overlay generated from the keymap and command registry.
 
-use super::{accent, band, dim, fg, panel_bg, Canvas};
+use super::{accent, band, desc, fg, panel_bg, Canvas};
 use crate::config::OPTIONS;
 use crate::keys::{Keymap, Mode, COMMANDS};
 use crate::text::TextRenderer;
@@ -97,7 +97,7 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, h: &Help, bottom_reserved: i3
             }
             Line::Item { left, right } => {
                 t.draw(cv, pad, y, left, fg(), col - pad);
-                t.draw(cv, col, y, right, dim(), cv.w - col - pad);
+                t.draw(cv, col, y, right, desc(), cv.w - col - pad);
             }
         }
     }
@@ -107,6 +107,24 @@ pub fn draw(cv: &mut Canvas, t: &mut TextRenderer, h: &Help, bottom_reserved: i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Renders the overlay in both looks to `target/help-*.ppm` for eyeballing.
+    #[test]
+    fn help_renders() {
+        let Ok(mut t) = TextRenderer::load("monospace", 13.0) else { return };
+        let (w, h) = (900, 520);
+        for (name, th) in [("default", crate::ui::Theme::default()), ("nerv", crate::ui::Theme::nerv(&crate::palette::Palette::default()))] {
+            let mut buf = vec![0xff40_4040u32; (w * h) as usize];
+            crate::ui::set_theme(th);
+            let mut hp = Help::new(&Keymap::with_defaults());
+            hp.scroll = hp.visible().len().saturating_sub(40);
+            draw(&mut Canvas { buf: &mut buf, w, h }, &mut t, &hp, 20);
+            crate::ui::set_theme(crate::ui::Theme::default());
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            out.extend(buf.iter().flat_map(|px| [(px >> 16) as u8, (px >> 8) as u8, *px as u8]));
+            let _ = std::fs::write(format!("target/help-{name}.ppm"), out);
+        }
+    }
 
     #[test]
     fn generated_and_filtered() {

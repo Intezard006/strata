@@ -181,6 +181,12 @@ pub fn fg() -> [u8; 3] {
 pub fn dim() -> [u8; 3] {
     theme().dim
 }
+/// Descriptions in the help overlay: secondary in the built-in look, full strength in the NERV look
+/// (dim amber on black is too faint to read behind a translucent window).
+pub fn desc() -> [u8; 3] {
+    let t = theme();
+    if t.nerv { t.fg } else { t.dim }
+}
 pub fn err() -> [u8; 3] {
     theme().err
 }
@@ -211,11 +217,13 @@ pub fn sel_band(cv: &mut Canvas, y: i32, lh: i32) {
     }
 }
 
-/// Section header row: a filled band, or a one-pixel rule under it in the NERV look.
+/// Section header row: a filled band.
 pub fn band(cv: &mut Canvas, y: i32, lh: i32) {
     let t = theme();
     if t.nerv {
-        cv.fill_rect(0, y + lh - 1, cv.w, 1, pm(t.line, 0xff));
+        // a dark wash of the text colour over the panel, as the built-in look's band is
+        let m = |i: usize| ((t.panel[i] as u32 * 80 + t.fg[i] as u32 * 20) / 100) as u8;
+        cv.fill_rect(0, y, cv.w, lh, pm([m(0), m(1), m(2)], 0xff));
     } else {
         cv.fill_rect(0, y, cv.w, lh, pm([0x45, 0x47, 0x5a], 0x90));
     }

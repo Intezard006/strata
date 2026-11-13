@@ -128,7 +128,7 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("previews", "Hover/keyboard previews of equations, theorems, figures (true/false)"),
     ("preview-hover-ms", "Hover time before a preview popup opens, in ms"),
     ("preview-bg", "Preview popup background (#rrggbbaa)"),
-    ("nerv-chrome", "Take UI colours from ~/.config/nerv/palette.toml when it exists (true/false; read at start and on reload)"),
+    ("nerv-chrome", "NERV colours from ~/.config/nerv/palette.toml (true/false)"),
     ("preview-max-scale", "Maximum render scale of the popup (1 = 100%)"),
     ("restore-position", "Reopen documents at the last position, zoom and recolor state (true/false)"),
     ("goto-printed", "`:goto N` and `NG` use printed page numbers when the book has them (true/false)"),
